@@ -274,14 +274,82 @@ def handle_text(message):
                 bot.reply_to(message, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
                 return
 
+            target_variants = set()
+            for encoding in ("utf-8", "latin-1"):
+                try:
+                    raw = watermark_text.encode(encoding)
+                    if raw:
+                        target_variants.add(raw)
+                        target_variants.add(
+                            raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+                        )
+                except Exception:
+                    continue
+
+            if not target_variants:
+                doc.close()
+                state['awaiting'] = None
+                bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
+                return
+
+            def strip_from_literal_string(content_bytes):
+                removed = 0
+                updated = content_bytes
+                for target in target_variants:
+                    if not target:
+                        continue
+                    updated, count = re.subn(re.escape(target), b"", updated)
+                    removed += count
+                return updated, removed
+
             matches = 0
+            processed_xrefs = set()
+
             for page in doc:
-                rects = page.search_for(watermark_text)
-                for rect in rects:
-                    page.add_redact_annot(rect, fill=None)
-                if rects:
-                    page.apply_redactions()
-                    matches += len(rects)
+                content_xrefs = page.get_contents() or []
+                if isinstance(content_xrefs, int):
+                    content_xrefs = [content_xrefs]
+
+                for xref in content_xrefs:
+                    if xref in processed_xrefs:
+                        continue
+                    processed_xrefs.add(xref)
+
+                    stream = doc.xref_stream(xref)
+                    if not stream:
+                        continue
+
+                    stream_matches = 0
+
+                    def replace_tj(match):
+                        nonlocal stream_matches
+                        literal_body = match.group(1)
+                        suffix = match.group(2)
+                        updated_body, removed = strip_from_literal_string(literal_body)
+                        stream_matches += removed
+                        return b"(" + updated_body + b")" + suffix
+
+                    def replace_tj_array(match):
+                        nonlocal stream_matches
+                        array_body = match.group(1)
+                        suffix = match.group(2)
+
+                        def replace_array_string(s_match):
+                            literal = s_match.group(0)
+                            inner = literal[1:-1]
+                            updated_inner, removed = strip_from_literal_string(inner)
+                            stream_matches += removed
+                            return b"(" + updated_inner + b")"
+
+                        updated_array = re.sub(rb"\((?:\\.|[^\\)])*\)", replace_array_string, array_body)
+                        return b"[" + updated_array + b"]" + suffix
+
+                    modified_stream = re.sub(rb"\(((?:\\.|[^\\)])*)\)(\s*Tj)", replace_tj, stream)
+                    modified_stream = re.sub(rb"\[(.*?)\](\s*TJ)", replace_tj_array, modified_stream, flags=re.DOTALL)
+
+                    if stream_matches > 0 and modified_stream != stream:
+                        doc.update_stream(xref, modified_stream)
+                        matches += stream_matches
 
             if matches == 0:
                 doc.close()
