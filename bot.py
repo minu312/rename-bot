@@ -10,6 +10,7 @@ TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 WHITE_FILL = (1, 1, 1)
+PDF_SAVE_GARBAGE_LEVEL = 3
 
 print(f"Token loaded: {bool(TOKEN)}")
 print(f"Allowed users string: {ALLOWED_USERS_STR}")
@@ -75,10 +76,8 @@ def build_output_name(original_name, suffix):
 
 
 def new_private_pdf_path():
-    temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', dir=STORAGE_DIR, delete=False)
-    temp_path = temp_file.name
-    temp_file.close()
-    os.chmod(temp_path, 0o600)
+    fd, temp_path = tempfile.mkstemp(suffix='.pdf', dir=STORAGE_DIR)
+    os.close(fd)
     return temp_path
 
 
@@ -190,7 +189,7 @@ def handle_text(message):
                 bot.reply_to(message, "Incorrect password. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
-            doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=3)
+            doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "unlocked"))
             delete_file(output_path)
@@ -234,7 +233,7 @@ def handle_text(message):
                 bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
-            doc.save(output_path, deflate=True, garbage=3)
+            doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "watermark_removed"))
             delete_file(output_path)
