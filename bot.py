@@ -67,9 +67,6 @@ def _parse_array_token(data, start):
     n = len(data)
     while i < n:
         byte = data[i]
-        if byte == 0x5C:
-            i += 2
-            continue
         if byte == 0x28:
             i = _parse_literal_string_token(data, i)
             continue
@@ -164,6 +161,13 @@ def _decode_pdf_string_token(token, token_type):
     return None
 
 
+def _replacement_if_watermark(token, token_type, watermark_text):
+    decoded = _decode_pdf_string_token(token, token_type)
+    if decoded == watermark_text:
+        return True, b"()"
+    return False, token
+
+
 def _scan_next_pdf_token(data, start):
     i = start
     n = len(data)
@@ -209,10 +213,10 @@ def _replace_text_in_tj_array(array_token, watermark_text):
         if byte == 0x28:
             end = _parse_literal_string_token(inner, i)
             token = inner[i:end]
-            decoded = _decode_pdf_literal_string(token)
-            if decoded == watermark_text:
+            should_replace, replacement = _replacement_if_watermark(token, "literal", watermark_text)
+            if should_replace:
                 parts.append(inner[cursor:i])
-                parts.append(b"()")
+                parts.append(replacement)
                 cursor = end
                 changed = True
                 removed += 1
@@ -221,10 +225,10 @@ def _replace_text_in_tj_array(array_token, watermark_text):
         if byte == 0x3C and i + 1 < n and inner[i + 1] != 0x3C:
             end = _parse_hex_string_token(inner, i)
             token = inner[i:end]
-            decoded = _decode_pdf_hex_string(token)
-            if decoded == watermark_text:
+            should_replace, replacement = _replacement_if_watermark(token, "hex", watermark_text)
+            if should_replace:
                 parts.append(inner[cursor:i])
-                parts.append(b"()")
+                parts.append(replacement)
                 cursor = end
                 changed = True
                 removed += 1
@@ -242,17 +246,15 @@ def remove_watermark_from_content_stream(stream_bytes, watermark_text):
     prev_token = None
     edits = []
     removed = 0
-    while True:
-        token = _scan_next_pdf_token(stream_bytes, i)
-        if token is None:
-            break
+    token = _scan_next_pdf_token(stream_bytes, i)
+    while token is not None:
         start, end, token_type, raw = token
         if token_type == "token":
             if raw == b"Tj" and prev_token and prev_token[2] in ("literal", "hex"):
                 prev_start, prev_end, prev_type, prev_raw = prev_token
-                decoded = _decode_pdf_string_token(prev_raw, prev_type)
-                if decoded == watermark_text:
-                    edits.append((prev_start, prev_end, b"()"))
+                should_replace, replacement = _replacement_if_watermark(prev_raw, prev_type, watermark_text)
+                if should_replace:
+                    edits.append((prev_start, prev_end, replacement))
                     removed += 1
             elif raw == b"TJ" and prev_token and prev_token[2] == "array":
                 prev_start, prev_end, _, prev_raw = prev_token
@@ -262,13 +264,14 @@ def remove_watermark_from_content_stream(stream_bytes, watermark_text):
                     removed += array_removed
         prev_token = token
         i = end
+        token = _scan_next_pdf_token(stream_bytes, i)
     if not edits:
         return stream_bytes, 0
     output = bytearray()
     cursor = 0
     for start, end, replacement in sorted(edits, key=lambda x: x[0]):
         if start < cursor:
-            continue
+            return stream_bytes, 0
         output.extend(stream_bytes[cursor:start])
         output.extend(replacement)
         cursor = end
