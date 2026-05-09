@@ -26,10 +26,6 @@ bot = telebot.TeleBot(TOKEN)
 user_states = {}
 
 
-def ensure_storage_dir():
-    os.makedirs(STORAGE_DIR, exist_ok=True)
-
-
 def cleanup_storage_dir():
     try:
         shutil.rmtree(STORAGE_DIR, ignore_errors=True)
@@ -107,7 +103,6 @@ def handle_document(message):
         bot.reply_to(message, "Please send a valid PDF file.")
         return
 
-    ensure_storage_dir()
     clear_user_state(user_id, delete_source=True)
 
     original_name = message.document.file_name or "document.pdf"
@@ -173,7 +168,7 @@ def handle_text(message):
     if awaiting == 'password':
         password = message.text or ""
         source_path = state['source_path']
-        output_path = new_private_pdf_path()
+        output_path = None
 
         try:
             doc = fitz.open(source_path)
@@ -189,6 +184,7 @@ def handle_text(message):
                 bot.reply_to(message, "Incorrect password. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
+            output_path = new_private_pdf_path()
             doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "unlocked"))
@@ -199,13 +195,14 @@ def handle_text(message):
         except Exception as e:
             print(f"Error unlocking PDF: {e}")
             bot.reply_to(message, f"Failed to unlock PDF: {str(e)}")
-            delete_file(output_path)
+            if output_path:
+                delete_file(output_path)
             return
 
     if awaiting == 'watermark_text':
         watermark_text = message.text or ""
         source_path = state['source_path']
-        output_path = new_private_pdf_path()
+        output_path = None
 
         if not watermark_text.strip():
             bot.reply_to(message, "Watermark text cannot be empty. Please send the exact text.")
@@ -215,7 +212,8 @@ def handle_text(message):
             doc = fitz.open(source_path)
             if doc.needs_pass:
                 doc.close()
-                bot.reply_to(message, "This PDF is password protected. Please use 'Unlock PDF' first.")
+                state['awaiting'] = None
+                bot.reply_to(message, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
                 return
 
             matches = 0
@@ -233,6 +231,7 @@ def handle_text(message):
                 bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
+            output_path = new_private_pdf_path()
             doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "watermark_removed"))
@@ -243,7 +242,8 @@ def handle_text(message):
         except Exception as e:
             print(f"Error removing watermark: {e}")
             bot.reply_to(message, f"Failed to remove watermark: {str(e)}")
-            delete_file(output_path)
+            if output_path:
+                delete_file(output_path)
             return
 
     bot.reply_to(message, "Please choose 'Unlock PDF' or 'Remove Watermark' after sending a PDF.")
