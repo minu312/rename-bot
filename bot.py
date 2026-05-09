@@ -215,7 +215,7 @@ def handle_text(message):
                 except Exception as restore_error:
                     print(f"Failed to restore source PDF after rename error: {restore_error}")
                     clear_user_state(user_id, delete_source=False)
-            bot.reply_to(message, f"Failed to rename PDF: {str(e)}")
+            bot.reply_to(message, "Failed to rename PDF. Please try again.")
             if os.path.exists(output_path) and os.path.exists(source_path):
                 delete_file(output_path)
             return
@@ -249,7 +249,7 @@ def handle_text(message):
             return
         except Exception as e:
             print(f"Error unlocking PDF: {e}")
-            bot.reply_to(message, f"Failed to unlock PDF: {str(e)}")
+            bot.reply_to(message, "Failed to unlock PDF. Please verify the password and try again.")
             if output_path:
                 delete_file(output_path)
             return
@@ -296,7 +296,7 @@ def handle_text(message):
             return
         except Exception as e:
             print(f"Error removing watermark: {e}")
-            bot.reply_to(message, f"Failed to remove watermark: {str(e)}")
+            bot.reply_to(message, "Failed to remove watermark. Please try again.")
             if output_path:
                 delete_file(output_path)
             return
