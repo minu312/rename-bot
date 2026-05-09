@@ -3,10 +3,13 @@ import telebot
 import fitz
 from telebot import types
 from uuid import uuid4
+import tempfile
+import shutil
+import atexit
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
-STORAGE_DIR = '/tmp/pdf-processor-files'
+STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 WHITE_FILL = (1, 1, 1)
 
 print(f"Token loaded: {bool(TOKEN)}")
@@ -25,6 +28,13 @@ user_states = {}
 
 def ensure_storage_dir():
     os.makedirs(STORAGE_DIR, exist_ok=True)
+
+
+def cleanup_storage_dir():
+    try:
+        shutil.rmtree(STORAGE_DIR, ignore_errors=True)
+    except Exception as e:
+        print(f"Storage dir cleanup failed: {e}")
 
 
 def delete_file(path):
@@ -63,6 +73,9 @@ def build_output_name(original_name, suffix):
     if base_name.lower().endswith('.pdf'):
         base_name = base_name[:-4]
     return f"{base_name}_{suffix}.pdf"
+
+
+atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -160,15 +173,17 @@ def handle_text(message):
             doc = fitz.open(source_path)
             if not doc.needs_pass:
                 doc.close()
-                bot.reply_to(message, "This PDF is not password protected.")
+                state['awaiting'] = None
+                bot.reply_to(message, "This PDF is not password protected. Choose another action or send a new PDF.", reply_markup=build_action_keyboard())
                 return
 
             if not doc.authenticate(password):
                 doc.close()
-                bot.reply_to(message, "Incorrect password. Please try again.")
+                state['awaiting'] = None
+                bot.reply_to(message, "Incorrect password. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
-            doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
+            doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=3)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "unlocked"))
             delete_file(output_path)
@@ -208,10 +223,11 @@ def handle_text(message):
 
             if matches == 0:
                 doc.close()
-                bot.reply_to(message, "No matching watermark text was found. Please send exact text and try again.")
+                state['awaiting'] = None
+                bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
                 return
 
-            doc.save(output_path)
+            doc.save(output_path, deflate=True, garbage=3)
             doc.close()
             send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "watermark_removed"))
             delete_file(output_path)
