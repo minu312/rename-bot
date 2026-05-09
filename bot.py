@@ -74,6 +74,7 @@ def normalize_pdf_filename(name):
     cleaned = os.path.basename((name or "").strip())
     cleaned = cleaned.replace('\x00', '')
     cleaned = re.sub(r'[\\/:*?"<>|]+', '_', cleaned)
+    cleaned = re.sub(r'_+', '_', cleaned)
     cleaned = re.sub(r'\s+', ' ', cleaned).strip(" .")
     if not cleaned:
         cleaned = "renamed_document"
@@ -208,11 +209,15 @@ def handle_text(message):
             return
         except Exception as e:
             print(f"Error renaming PDF: {e}")
+            if os.path.exists(output_path) and not os.path.exists(source_path):
+                try:
+                    os.replace(output_path, source_path)
+                except Exception as restore_error:
+                    print(f"Failed to restore source PDF after rename error: {restore_error}")
+                    clear_user_state(user_id, delete_source=False)
             bot.reply_to(message, f"Failed to rename PDF: {str(e)}")
-            if os.path.exists(output_path):
+            if os.path.exists(output_path) and os.path.exists(source_path):
                 delete_file(output_path)
-            if not os.path.exists(source_path):
-                clear_user_state(user_id, delete_source=False)
             return
 
     if awaiting == 'password':
