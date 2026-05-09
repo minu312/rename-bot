@@ -26,6 +26,278 @@ bot = telebot.TeleBot(TOKEN)
 user_states = {}
 
 
+def _is_pdf_whitespace(byte):
+    return byte in b"\x00\t\n\x0c\r "
+
+
+def _is_pdf_delimiter(byte):
+    return byte in b"()<>[]{}/%"
+
+
+def _parse_literal_string_token(data, start):
+    i = start + 1
+    depth = 1
+    n = len(data)
+    while i < n:
+        byte = data[i]
+        if byte == 0x5C:
+            i += 2
+            continue
+        if byte == 0x28:
+            depth += 1
+        elif byte == 0x29:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _parse_hex_string_token(data, start):
+    i = start + 1
+    n = len(data)
+    while i < n and data[i] != 0x3E:
+        i += 1
+    return min(i + 1, n)
+
+
+def _parse_array_token(data, start):
+    i = start + 1
+    depth = 1
+    n = len(data)
+    while i < n:
+        byte = data[i]
+        if byte == 0x28:
+            i = _parse_literal_string_token(data, i)
+            continue
+        if byte == 0x3C and i + 1 < n and data[i + 1] != 0x3C:
+            i = _parse_hex_string_token(data, i)
+            continue
+        if byte == 0x5B:
+            depth += 1
+        elif byte == 0x5D:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _decode_pdf_literal_string(token):
+    if len(token) < 2:
+        return None
+    data = token[1:-1]
+    result = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        byte = data[i]
+        if byte != 0x5C:
+            result.append(byte)
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        esc = data[i]
+        if esc in b"nrtbf":
+            result.extend({
+                ord("n"): b"\n",
+                ord("r"): b"\r",
+                ord("t"): b"\t",
+                ord("b"): b"\b",
+                ord("f"): b"\f",
+            }[esc])
+            i += 1
+            continue
+        if esc in b"()\\":
+            result.append(esc)
+            i += 1
+            continue
+        if esc in b"\n\r":
+            i += 1
+            if esc == ord("\r") and i < n and data[i] == ord("\n"):
+                i += 1
+            continue
+        if 48 <= esc <= 55:
+            octal = bytes([esc])
+            i += 1
+            count = 1
+            while i < n and count < 3 and 48 <= data[i] <= 55:
+                octal += bytes([data[i]])
+                i += 1
+                count += 1
+            result.append(int(octal, 8))
+            continue
+        result.append(esc)
+        i += 1
+    try:
+        return result.decode("utf-8")
+    except UnicodeDecodeError:
+        return result.decode("latin-1", errors="ignore")
+
+
+def _decode_pdf_hex_string(token):
+    if len(token) < 2:
+        return None
+    hex_data = re.sub(rb"\s+", b"", token[1:-1])
+    if len(hex_data) % 2 == 1:
+        hex_data += b"0"
+    try:
+        decoded = bytes.fromhex(hex_data.decode("ascii"))
+    except Exception:
+        return None
+    try:
+        return decoded.decode("utf-8")
+    except UnicodeDecodeError:
+        return decoded.decode("latin-1", errors="ignore")
+
+
+def _decode_pdf_string_token(token, token_type):
+    if token_type == "literal":
+        return _decode_pdf_literal_string(token)
+    if token_type == "hex":
+        return _decode_pdf_hex_string(token)
+    return None
+
+
+def _replacement_if_watermark(token, token_type, watermark_text):
+    decoded = _decode_pdf_string_token(token, token_type)
+    if decoded == watermark_text:
+        return True, b"()"
+    return False, token
+
+
+def _scan_next_pdf_token(data, start):
+    i = start
+    n = len(data)
+    while i < n:
+        byte = data[i]
+        if _is_pdf_whitespace(byte):
+            i += 1
+            continue
+        if byte == 0x25:
+            while i < n and data[i] not in (0x0A, 0x0D):
+                i += 1
+            continue
+        break
+    if i >= n:
+        return None
+    token_start = i
+    byte = data[i]
+    if byte == 0x28:
+        end = _parse_literal_string_token(data, i)
+        return token_start, end, "literal", data[token_start:end]
+    if byte == 0x3C and i + 1 < n and data[i + 1] != 0x3C:
+        end = _parse_hex_string_token(data, i)
+        return token_start, end, "hex", data[token_start:end]
+    if byte == 0x5B:
+        end = _parse_array_token(data, i)
+        return token_start, end, "array", data[token_start:end]
+    i += 1
+    while i < n and (not _is_pdf_whitespace(data[i])) and (not _is_pdf_delimiter(data[i])):
+        i += 1
+    return token_start, i, "token", data[token_start:i]
+
+
+def _replace_text_in_tj_array(array_token, watermark_text):
+    inner = array_token[1:-1]
+    i = 0
+    n = len(inner)
+    changed = False
+    removed = 0
+    parts = []
+    cursor = 0
+    while i < n:
+        byte = inner[i]
+        if byte == 0x28:
+            end = _parse_literal_string_token(inner, i)
+            token = inner[i:end]
+            should_replace, replacement = _replacement_if_watermark(token, "literal", watermark_text)
+            if should_replace:
+                parts.append(inner[cursor:i])
+                parts.append(replacement)
+                cursor = end
+                changed = True
+                removed += 1
+            i = end
+            continue
+        if byte == 0x3C and i + 1 < n and inner[i + 1] != 0x3C:
+            end = _parse_hex_string_token(inner, i)
+            token = inner[i:end]
+            should_replace, replacement = _replacement_if_watermark(token, "hex", watermark_text)
+            if should_replace:
+                parts.append(inner[cursor:i])
+                parts.append(replacement)
+                cursor = end
+                changed = True
+                removed += 1
+            i = end
+            continue
+        i += 1
+    if not changed:
+        return array_token, 0
+    parts.append(inner[cursor:])
+    return b"[" + b"".join(parts) + b"]", removed
+
+
+def remove_watermark_from_content_stream(stream_bytes, watermark_text):
+    i = 0
+    prev_token = None
+    edits = []
+    removed = 0
+    token = _scan_next_pdf_token(stream_bytes, i)
+    while token is not None:
+        start, end, token_type, raw = token
+        if token_type == "token":
+            if raw == b"Tj" and prev_token and prev_token[2] in ("literal", "hex"):
+                prev_start, prev_end, prev_type, prev_raw = prev_token
+                should_replace, replacement = _replacement_if_watermark(prev_raw, prev_type, watermark_text)
+                if should_replace:
+                    edits.append((prev_start, prev_end, replacement))
+                    removed += 1
+            elif raw == b"TJ" and prev_token and prev_token[2] == "array":
+                prev_start, prev_end, _, prev_raw = prev_token
+                updated_array, array_removed = _replace_text_in_tj_array(prev_raw, watermark_text)
+                if array_removed > 0:
+                    edits.append((prev_start, prev_end, updated_array))
+                    removed += array_removed
+        prev_token = token
+        i = end
+        token = _scan_next_pdf_token(stream_bytes, i)
+    if not edits:
+        return stream_bytes, 0
+    output = bytearray()
+    cursor = 0
+    for start, end, replacement in sorted(edits, key=lambda x: x[0]):
+        if start < cursor:
+            print("Skipping watermark edit due to overlapping stream modifications.")
+            return stream_bytes, 0
+        output.extend(stream_bytes[cursor:start])
+        output.extend(replacement)
+        cursor = end
+    output.extend(stream_bytes[cursor:])
+    return bytes(output), removed
+
+
+def remove_watermark_by_stream_edit(doc, watermark_text):
+    total_removed = 0
+    for page in doc:
+        page.clean_contents()
+        content_refs = page.get_contents()
+        if isinstance(content_refs, int):
+            content_refs = [content_refs]
+        for xref in content_refs or []:
+            stream_bytes = doc.xref_stream(xref)
+            if not stream_bytes:
+                continue
+            updated_stream, removed = remove_watermark_from_content_stream(stream_bytes, watermark_text)
+            if removed > 0 and updated_stream != stream_bytes:
+                doc.update_stream(xref, updated_stream)
+                total_removed += removed
+    return total_removed
+
+
 def cleanup_storage_dir():
     try:
         shutil.rmtree(STORAGE_DIR, ignore_errors=True)
@@ -274,14 +546,7 @@ def handle_text(message):
                 bot.reply_to(message, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
                 return
 
-            matches = 0
-            for page in doc:
-                rects = page.search_for(watermark_text)
-                for rect in rects:
-                    page.add_redact_annot(rect, fill=None)
-                if rects:
-                    page.apply_redactions()
-                    matches += len(rects)
+            matches = remove_watermark_by_stream_edit(doc, watermark_text)
 
             if matches == 0:
                 doc.close()
