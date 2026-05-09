@@ -271,6 +271,7 @@ def remove_watermark_from_content_stream(stream_bytes, watermark_text):
     cursor = 0
     for start, end, replacement in sorted(edits, key=lambda x: x[0]):
         if start < cursor:
+            print("Skipping watermark edit due to overlapping stream modifications.")
             return stream_bytes, 0
         output.extend(stream_bytes[cursor:start])
         output.extend(replacement)
