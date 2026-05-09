@@ -6,7 +6,8 @@ from uuid import uuid4
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
-STORAGE_DIR = '/tmp/rename-bot-files'
+STORAGE_DIR = '/tmp/pdf-processor-files'
+WHITE_FILL = (1, 1, 1)
 
 print(f"Token loaded: {bool(TOKEN)}")
 print(f"Allowed users string: {ALLOWED_USERS_STR}")
@@ -55,6 +56,13 @@ def build_action_keyboard():
 def send_processed_pdf(user_id, output_path, output_name):
     with open(output_path, 'rb') as final_file:
         bot.send_document(user_id, final_file, visible_file_name=output_name)
+
+
+def build_output_name(original_name, suffix):
+    base_name = original_name or "document.pdf"
+    if base_name.lower().endswith('.pdf'):
+        base_name = base_name[:-4]
+    return f"{base_name}_{suffix}.pdf"
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -162,7 +170,7 @@ def handle_text(message):
 
             doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
             doc.close()
-            send_processed_pdf(user_id, output_path, "unlocked.pdf")
+            send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "unlocked"))
             delete_file(output_path)
             clear_user_state(user_id, delete_source=True)
             print("Unlocked PDF sent successfully.")
@@ -193,7 +201,7 @@ def handle_text(message):
             for page in doc:
                 rects = page.search_for(watermark_text)
                 for rect in rects:
-                    page.add_redact_annot(rect, fill=(1, 1, 1))
+                    page.add_redact_annot(rect, fill=WHITE_FILL)
                 if rects:
                     page.apply_redactions()
                     matches += len(rects)
@@ -205,7 +213,7 @@ def handle_text(message):
 
             doc.save(output_path)
             doc.close()
-            send_processed_pdf(user_id, output_path, "watermark_removed.pdf")
+            send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "watermark_removed"))
             delete_file(output_path)
             clear_user_state(user_id, delete_source=True)
             print("Watermark-removed PDF sent successfully.")
