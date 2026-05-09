@@ -2,7 +2,6 @@ import os
 import telebot
 import fitz
 from telebot import types
-from uuid import uuid4
 import tempfile
 import shutil
 import atexit
@@ -75,6 +74,14 @@ def build_output_name(original_name, suffix):
     return f"{base_name}_{suffix}.pdf"
 
 
+def new_private_pdf_path():
+    temp_file = tempfile.NamedTemporaryFile(mode='wb', suffix='.pdf', dir=STORAGE_DIR, delete=False)
+    temp_path = temp_file.name
+    temp_file.close()
+    os.chmod(temp_path, 0o600)
+    return temp_path
+
+
 atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
@@ -105,7 +112,7 @@ def handle_document(message):
     clear_user_state(user_id, delete_source=True)
 
     original_name = message.document.file_name or "document.pdf"
-    source_path = os.path.join(STORAGE_DIR, f"{user_id}_{uuid4().hex}.pdf")
+    source_path = new_private_pdf_path()
 
     try:
         file_info = bot.get_file(message.document.file_id)
@@ -153,7 +160,7 @@ def handle_action_choice(call):
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     user_id = message.from_user.id
-    print(f"[Text] Received '{message.text}' from User ID: {user_id}")
+    print(f"[Text] Received input from User ID: {user_id}")
     
     if user_id not in ALLOWED_USERS:
         return
@@ -167,7 +174,7 @@ def handle_text(message):
     if awaiting == 'password':
         password = message.text or ""
         source_path = state['source_path']
-        output_path = os.path.join(STORAGE_DIR, f"{user_id}_{uuid4().hex}_unlocked.pdf")
+        output_path = new_private_pdf_path()
 
         try:
             doc = fitz.open(source_path)
@@ -199,7 +206,7 @@ def handle_text(message):
     if awaiting == 'watermark_text':
         watermark_text = message.text or ""
         source_path = state['source_path']
-        output_path = os.path.join(STORAGE_DIR, f"{user_id}_{uuid4().hex}_watermark_removed.pdf")
+        output_path = new_private_pdf_path()
 
         if not watermark_text.strip():
             bot.reply_to(message, "Watermark text cannot be empty. Please send the exact text.")
