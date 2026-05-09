@@ -5,11 +5,11 @@ from telebot import types
 import tempfile
 import shutil
 import atexit
+import re
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
-WHITE_FILL = (1, 1, 1)
 PDF_SAVE_GARBAGE_LEVEL = 3
 
 print(f"Token loaded: {bool(TOKEN)}")
@@ -52,10 +52,9 @@ def clear_user_state(user_id, delete_source=False):
 
 def build_action_keyboard():
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(
-        types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"),
-        types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"),
-    )
+    keyboard.row(types.InlineKeyboardButton("Rename PDF", callback_data="rename_pdf"))
+    keyboard.row(types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"))
+    keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
     return keyboard
 
 
@@ -69,6 +68,18 @@ def build_output_name(original_name, suffix):
     if base_name.lower().endswith('.pdf'):
         base_name = base_name[:-4]
     return f"{base_name}_{suffix}.pdf"
+
+
+def normalize_pdf_filename(name):
+    cleaned = os.path.basename((name or "").strip())
+    cleaned = cleaned.replace('\x00', '')
+    cleaned = re.sub(r'[\\/:*?"<>|]+', '_', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip(" .")
+    if not cleaned:
+        cleaned = "renamed_document"
+    if not cleaned.lower().endswith('.pdf'):
+        cleaned = f"{cleaned}.pdf"
+    return cleaned
 
 
 def new_private_pdf_path():
@@ -128,7 +139,7 @@ def handle_document(message):
     bot.reply_to(message, "Choose an action for this PDF:", reply_markup=build_action_keyboard())
 
 
-@bot.callback_query_handler(func=lambda call: call.data in ("unlock_pdf", "remove_watermark"))
+@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark"))
 def handle_action_choice(call):
     user_id = call.from_user.id
 
@@ -139,6 +150,12 @@ def handle_action_choice(call):
     if user_id not in user_states or not user_states[user_id].get('source_path'):
         bot.answer_callback_query(call.id, "Please send a PDF first.")
         bot.send_message(user_id, "Please send a PDF file first.")
+        return
+
+    if call.data == "rename_pdf":
+        user_states[user_id]['awaiting'] = 'new_name'
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, "Please type and send the new file name.")
         return
 
     if call.data == "unlock_pdf":
@@ -165,6 +182,39 @@ def handle_text(message):
         return
 
     awaiting = state.get('awaiting')
+    if awaiting == 'new_name':
+        source_path = state['source_path']
+        requested_name = (message.text or "").strip()
+
+        if not requested_name:
+            bot.reply_to(message, "File name cannot be empty. Please send a valid name.")
+            return
+
+        output_name = normalize_pdf_filename(requested_name)
+        output_path = os.path.join(STORAGE_DIR, output_name)
+        name_root, ext = os.path.splitext(output_name)
+        counter = 1
+        while os.path.exists(output_path):
+            output_name = f"{name_root}_{counter}{ext}"
+            output_path = os.path.join(STORAGE_DIR, output_name)
+            counter += 1
+
+        try:
+            os.replace(source_path, output_path)
+            send_processed_pdf(user_id, output_path, output_name)
+            delete_file(output_path)
+            clear_user_state(user_id, delete_source=False)
+            print("Renamed PDF sent successfully.")
+            return
+        except Exception as e:
+            print(f"Error renaming PDF: {e}")
+            bot.reply_to(message, f"Failed to rename PDF: {str(e)}")
+            if os.path.exists(output_path):
+                delete_file(output_path)
+            if not os.path.exists(source_path):
+                clear_user_state(user_id, delete_source=False)
+            return
+
     if awaiting == 'password':
         password = message.text or ""
         source_path = state['source_path']
@@ -220,7 +270,7 @@ def handle_text(message):
             for page in doc:
                 rects = page.search_for(watermark_text)
                 for rect in rects:
-                    page.add_redact_annot(rect, fill=WHITE_FILL)
+                    page.add_redact_annot(rect, fill=None)
                 if rects:
                     page.apply_redactions()
                     matches += len(rects)
@@ -246,7 +296,7 @@ def handle_text(message):
                 delete_file(output_path)
             return
 
-    bot.reply_to(message, "Please choose 'Unlock PDF' or 'Remove Watermark' after sending a PDF.")
+    bot.reply_to(message, "Please choose 'Rename PDF', 'Remove Watermark', or 'Unlock PDF' after sending a PDF.")
 
 print("Starting bot polling...")
 bot.polling(none_stop=True)
