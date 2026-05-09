@@ -335,6 +335,7 @@ def handle_text(message):
                         suffix = match.group(2)
 
                         def replace_array_string(s_match):
+                            nonlocal stream_matches
                             literal = s_match.group(0)
                             inner = literal[1:-1]
                             updated_inner, removed = strip_from_literal_string(inner)
