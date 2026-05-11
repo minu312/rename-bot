@@ -12,6 +12,15 @@ TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 PDF_SAVE_GARBAGE_LEVEL = 3
+RANDOM_WATERMARK_PAGE_INTERVAL = 3
+TEXT_WATERMARK_HORIZONTAL_MARGIN_RATIO = 0.12
+TEXT_WATERMARK_TOP_RATIO = 0.42
+TEXT_WATERMARK_BOTTOM_RATIO = 0.58
+TEXT_WATERMARK_FONT_MIN = 18
+TEXT_WATERMARK_FONT_MAX = 48
+TEXT_WATERMARK_FONT_DIVISOR = 12
+IMAGE_WATERMARK_WIDTH_RATIO = 0.4
+IMAGE_WATERMARK_HEIGHT_RATIO = 0.22
 
 print(f"Token loaded: {bool(TOKEN)}")
 print(f"Allowed users string: {ALLOWED_USERS_STR}")
@@ -133,7 +142,7 @@ def get_target_page_indexes(doc, layout):
     if page_count <= 0:
         return []
     if layout == "random":
-        random_pages = [i for i in range(page_count) if random.randint(1, 3) == 1]
+        random_pages = [i for i in range(page_count) if random.randint(1, RANDOM_WATERMARK_PAGE_INTERVAL) == 1]
         return random_pages or [0]
     return list(range(page_count))
 
@@ -142,14 +151,14 @@ def add_text_watermark(doc, watermark_text, layout):
     for page_index in get_target_page_indexes(doc, layout):
         page = doc[page_index]
         rect = page.rect
-        horizontal_margin = rect.width * 0.12
+        horizontal_margin = rect.width * TEXT_WATERMARK_HORIZONTAL_MARGIN_RATIO
         box = fitz.Rect(
             horizontal_margin,
-            rect.height * 0.42,
+            rect.height * TEXT_WATERMARK_TOP_RATIO,
             rect.width - horizontal_margin,
-            rect.height * 0.58,
+            rect.height * TEXT_WATERMARK_BOTTOM_RATIO,
         )
-        font_size = max(18, min(48, int(rect.width / 12)))
+        font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)))
         page.insert_textbox(
             box,
             watermark_text,
@@ -164,8 +173,8 @@ def add_image_watermark(doc, image_path, layout):
     for page_index in get_target_page_indexes(doc, layout):
         page = doc[page_index]
         rect = page.rect
-        watermark_width = rect.width * 0.4
-        watermark_height = rect.height * 0.22
+        watermark_width = rect.width * IMAGE_WATERMARK_WIDTH_RATIO
+        watermark_height = rect.height * IMAGE_WATERMARK_HEIGHT_RATIO
         image_rect = fitz.Rect(
             (rect.width - watermark_width) / 2,
             (rect.height - watermark_height) / 2,
