@@ -22,7 +22,7 @@ TEXT_WATERMARK_FONT_DIVISOR = 12
 IMAGE_WATERMARK_WIDTH_RATIO = 0.4
 IMAGE_WATERMARK_HEIGHT_RATIO = 0.22
 MAX_IMAGE_SUFFIX_LENGTH = 10
-PHOTO_WATERMARK_SUFFIX = ".jpg"
+TELEGRAM_PHOTO_SUFFIX = ".jpg"
 TEXT_WATERMARK_LENGTH_BASE = 40
 
 print(f"Token loaded: {bool(TOKEN)}")
@@ -125,6 +125,13 @@ def new_private_image_path(suffix):
     return temp_path
 
 
+def get_safe_image_suffix(file_name):
+    extension = os.path.splitext(file_name or "")[1].lower()
+    if not extension or len(extension) > MAX_IMAGE_SUFFIX_LENGTH:
+        return ".png"
+    return extension
+
+
 def is_supported_image_document(document):
     mime_type = (document.mime_type or "").lower()
     file_name = (document.file_name or "").lower()
@@ -161,10 +168,11 @@ def add_text_watermark(doc, watermark_text, layout):
             rect.width - horizontal_margin,
             rect.height * TEXT_WATERMARK_BOTTOM_RATIO,
         )
-        font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)))
+        base_font_size = int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)
         text_length = max(1, len(watermark_text))
         if text_length > TEXT_WATERMARK_LENGTH_BASE:
-            font_size = max(TEXT_WATERMARK_FONT_MIN, int(font_size * TEXT_WATERMARK_LENGTH_BASE / text_length))
+            base_font_size = int(base_font_size * TEXT_WATERMARK_LENGTH_BASE / text_length)
+        font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, base_font_size))
         page.insert_textbox(
             box,
             watermark_text,
@@ -261,12 +269,8 @@ def handle_document(message):
             bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
             return
 
-        extension = os.path.splitext(message.document.file_name or "")[1].lower()
-        if not extension or len(extension) > MAX_IMAGE_SUFFIX_LENGTH:
-            extension = ".png"
-
         try:
-            image_path = download_telegram_file(message.document.file_id, extension)
+            image_path = download_telegram_file(message.document.file_id, get_safe_image_suffix(message.document.file_name))
             process_add_watermark(user_id, state, image_path=image_path)
         except Exception as e:
             print(f"Error downloading watermark image: {e}")
@@ -392,7 +396,7 @@ def handle_photo(message):
         return
 
     try:
-        image_path = download_telegram_file(message.photo[-1].file_id, PHOTO_WATERMARK_SUFFIX)
+        image_path = download_telegram_file(message.photo[-1].file_id, TELEGRAM_PHOTO_SUFFIX)
         process_add_watermark(user_id, state, image_path=image_path)
     except Exception as e:
         print(f"Error downloading watermark photo: {e}")
