@@ -6,6 +6,7 @@ import tempfile
 import shutil
 import atexit
 import re
+import random
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
@@ -54,7 +55,22 @@ def build_action_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(types.InlineKeyboardButton("Rename PDF", callback_data="rename_pdf"))
     keyboard.row(types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"))
+    keyboard.row(types.InlineKeyboardButton("Add Watermark", callback_data="add_watermark"))
     keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
+    return keyboard
+
+
+def build_watermark_type_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(types.InlineKeyboardButton("Text Watermark", callback_data="watermark_type_text"))
+    keyboard.row(types.InlineKeyboardButton("Image Watermark", callback_data="watermark_type_image"))
+    return keyboard
+
+
+def build_watermark_layout_keyboard():
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(types.InlineKeyboardButton("Every page", callback_data="watermark_layout_every"))
+    keyboard.row(types.InlineKeyboardButton("Random", callback_data="watermark_layout_random"))
     return keyboard
 
 
@@ -90,6 +106,119 @@ def new_private_pdf_path():
     return temp_path
 
 
+def new_private_image_path(suffix):
+    safe_suffix = suffix if suffix and len(suffix) <= 10 else ".png"
+    fd, temp_path = tempfile.mkstemp(suffix=safe_suffix, dir=STORAGE_DIR)
+    os.close(fd)
+    return temp_path
+
+
+def is_supported_image_document(document):
+    mime_type = (document.mime_type or "").lower()
+    file_name = (document.file_name or "").lower()
+    return mime_type.startswith("image/") or file_name.endswith((".png", ".jpg", ".jpeg", ".webp"))
+
+
+def download_telegram_file(file_id, suffix):
+    file_info = bot.get_file(file_id)
+    downloaded_file = bot.download_file(file_info.file_path)
+    output_path = new_private_image_path(suffix)
+    with open(output_path, 'wb') as out_file:
+        out_file.write(downloaded_file)
+    return output_path
+
+
+def get_target_page_indexes(doc, layout):
+    page_count = doc.page_count
+    if page_count <= 0:
+        return []
+    if layout == "random":
+        random_pages = [i for i in range(page_count) if random.randint(1, 3) == 1]
+        return random_pages or [0]
+    return list(range(page_count))
+
+
+def add_text_watermark(doc, watermark_text, layout):
+    for page_index in get_target_page_indexes(doc, layout):
+        page = doc[page_index]
+        rect = page.rect
+        horizontal_margin = rect.width * 0.12
+        box = fitz.Rect(
+            horizontal_margin,
+            rect.height * 0.42,
+            rect.width - horizontal_margin,
+            rect.height * 0.58,
+        )
+        font_size = max(18, min(48, int(rect.width / 12)))
+        page.insert_textbox(
+            box,
+            watermark_text,
+            fontsize=font_size,
+            color=(0.75, 0.75, 0.75),
+            align=1,
+            overlay=True,
+        )
+
+
+def add_image_watermark(doc, image_path, layout):
+    for page_index in get_target_page_indexes(doc, layout):
+        page = doc[page_index]
+        rect = page.rect
+        watermark_width = rect.width * 0.4
+        watermark_height = rect.height * 0.22
+        image_rect = fitz.Rect(
+            (rect.width - watermark_width) / 2,
+            (rect.height - watermark_height) / 2,
+            (rect.width + watermark_width) / 2,
+            (rect.height + watermark_height) / 2,
+        )
+        page.insert_image(image_rect, filename=image_path, overlay=True, keep_proportion=True)
+
+
+def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
+    source_path = state['source_path']
+    output_path = None
+    doc = None
+
+    try:
+        doc = fitz.open(source_path)
+        if doc.needs_pass:
+            state['awaiting'] = None
+            bot.send_message(user_id, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
+            return
+
+        watermark_type = state.get('watermark_type')
+        watermark_layout = state.get('watermark_layout', 'every')
+
+        if watermark_type == 'text':
+            add_text_watermark(doc, watermark_text, watermark_layout)
+        elif watermark_type == 'image':
+            add_image_watermark(doc, image_path, watermark_layout)
+        else:
+            bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
+            return
+
+        output_path = new_private_pdf_path()
+        doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+        send_processed_pdf(user_id, output_path, build_output_name(state.get('original_name'), "watermarked"))
+        delete_file(output_path)
+        clear_user_state(user_id, delete_source=True)
+        print("Watermarked PDF sent successfully.")
+    except Exception as e:
+        print(f"Error adding watermark: {e}")
+        bot.send_message(user_id, "Failed to add watermark. Please try again.")
+        if output_path:
+            delete_file(output_path)
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if image_path:
+            delete_file(image_path)
+
+
 atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
@@ -109,6 +238,24 @@ def handle_document(message):
     
     if user_id not in ALLOWED_USERS:
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
+        return
+
+    state = user_states.get(user_id)
+    if state and state.get('awaiting') == 'watermark_image_upload':
+        if not is_supported_image_document(message.document):
+            bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
+            return
+
+        extension = os.path.splitext(message.document.file_name or "")[1].lower()
+        if not extension or len(extension) > 10:
+            extension = ".png"
+
+        try:
+            image_path = download_telegram_file(message.document.file_id, extension)
+            process_add_watermark(user_id, state, image_path=image_path)
+        except Exception as e:
+            print(f"Error downloading watermark image: {e}")
+            bot.reply_to(message, "Could not download the image. Please try again.")
         return
     
     if message.document.mime_type != 'application/pdf' and not message.document.file_name.lower().endswith('.pdf'):
@@ -141,7 +288,7 @@ def handle_document(message):
     bot.reply_to(message, "Choose an action for this PDF:", reply_markup=build_action_keyboard())
 
 
-@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark"))
+@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark"))
 def handle_action_choice(call):
     user_id = call.from_user.id
 
@@ -166,9 +313,76 @@ def handle_action_choice(call):
         bot.send_message(user_id, "Please send the password for this PDF.")
         return
 
+    if call.data == "add_watermark":
+        user_states[user_id]['awaiting'] = 'watermark_type'
+        user_states[user_id]['watermark_type'] = None
+        user_states[user_id]['watermark_layout'] = None
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, "Choose watermark type:", reply_markup=build_watermark_type_keyboard())
+        return
+
     user_states[user_id]['awaiting'] = 'watermark_text'
     bot.answer_callback_query(call.id)
     bot.send_message(user_id, "Please send the exact watermark text to remove.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data in ("watermark_type_text", "watermark_type_image", "watermark_layout_every", "watermark_layout_random"))
+def handle_add_watermark_choices(call):
+    user_id = call.from_user.id
+
+    if user_id not in ALLOWED_USERS:
+        bot.answer_callback_query(call.id, "Not authorized.")
+        return
+
+    state = user_states.get(user_id)
+    if not state or not state.get('source_path'):
+        bot.answer_callback_query(call.id, "Please send a PDF first.")
+        bot.send_message(user_id, "Please send a PDF file first.")
+        return
+
+    if call.data in ("watermark_type_text", "watermark_type_image"):
+        state['watermark_type'] = 'text' if call.data == "watermark_type_text" else 'image'
+        state['awaiting'] = 'watermark_layout'
+        bot.answer_callback_query(call.id)
+        bot.send_message(user_id, "Choose watermark layout:", reply_markup=build_watermark_layout_keyboard())
+        return
+
+    if state.get('watermark_type') not in ('text', 'image'):
+        bot.answer_callback_query(call.id, "Choose watermark type first.")
+        bot.send_message(user_id, "Please choose watermark type first.", reply_markup=build_watermark_type_keyboard())
+        return
+
+    state['watermark_layout'] = 'every' if call.data == "watermark_layout_every" else 'random'
+    bot.answer_callback_query(call.id)
+
+    if state['watermark_type'] == 'text':
+        state['awaiting'] = 'watermark_add_text'
+        bot.send_message(user_id, "Please send the watermark text.")
+        return
+
+    state['awaiting'] = 'watermark_image_upload'
+    bot.send_message(user_id, "Please upload the watermark image (photo or image document).")
+
+
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
+    user_id = message.from_user.id
+
+    if user_id not in ALLOWED_USERS:
+        return
+
+    state = user_states.get(user_id)
+    if not state or state.get('awaiting') != 'watermark_image_upload':
+        bot.reply_to(message, "Please send a PDF file first and choose 'Add Watermark'.")
+        return
+
+    try:
+        image_path = download_telegram_file(message.photo[-1].file_id, ".jpg")
+        process_add_watermark(user_id, state, image_path=image_path)
+    except Exception as e:
+        print(f"Error downloading watermark photo: {e}")
+        bot.reply_to(message, "Could not download the image. Please try again.")
+
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
@@ -373,7 +587,15 @@ def handle_text(message):
                 delete_file(output_path)
             return
 
-    bot.reply_to(message, "Please choose 'Rename PDF', 'Remove Watermark', or 'Unlock PDF' after sending a PDF.")
+    if awaiting == 'watermark_add_text':
+        watermark_text = (message.text or "").strip()
+        if not watermark_text:
+            bot.reply_to(message, "Watermark text cannot be empty. Please send valid text.")
+            return
+        process_add_watermark(user_id, state, watermark_text=watermark_text)
+        return
+
+    bot.reply_to(message, "Please choose 'Rename PDF', 'Remove Watermark', 'Add Watermark', or 'Unlock PDF' after sending a PDF.")
 
 print("Starting bot polling...")
 bot.polling(none_stop=True)
