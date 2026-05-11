@@ -21,6 +21,9 @@ TEXT_WATERMARK_FONT_MAX = 48
 TEXT_WATERMARK_FONT_DIVISOR = 12
 IMAGE_WATERMARK_WIDTH_RATIO = 0.4
 IMAGE_WATERMARK_HEIGHT_RATIO = 0.22
+MAX_IMAGE_SUFFIX_LENGTH = 10
+PHOTO_WATERMARK_SUFFIX = ".jpg"
+TEXT_WATERMARK_LENGTH_BASE = 40
 
 print(f"Token loaded: {bool(TOKEN)}")
 print(f"Allowed users string: {ALLOWED_USERS_STR}")
@@ -116,7 +119,7 @@ def new_private_pdf_path():
 
 
 def new_private_image_path(suffix):
-    safe_suffix = suffix if suffix and len(suffix) <= 10 else ".png"
+    safe_suffix = suffix if suffix and len(suffix) <= MAX_IMAGE_SUFFIX_LENGTH else ".png"
     fd, temp_path = tempfile.mkstemp(suffix=safe_suffix, dir=STORAGE_DIR)
     os.close(fd)
     return temp_path
@@ -159,6 +162,9 @@ def add_text_watermark(doc, watermark_text, layout):
             rect.height * TEXT_WATERMARK_BOTTOM_RATIO,
         )
         font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)))
+        text_length = max(1, len(watermark_text))
+        if text_length > TEXT_WATERMARK_LENGTH_BASE:
+            font_size = max(TEXT_WATERMARK_FONT_MIN, int(font_size * TEXT_WATERMARK_LENGTH_BASE / text_length))
         page.insert_textbox(
             box,
             watermark_text,
@@ -256,7 +262,7 @@ def handle_document(message):
             return
 
         extension = os.path.splitext(message.document.file_name or "")[1].lower()
-        if not extension or len(extension) > 10:
+        if not extension or len(extension) > MAX_IMAGE_SUFFIX_LENGTH:
             extension = ".png"
 
         try:
@@ -386,7 +392,7 @@ def handle_photo(message):
         return
 
     try:
-        image_path = download_telegram_file(message.photo[-1].file_id, ".jpg")
+        image_path = download_telegram_file(message.photo[-1].file_id, PHOTO_WATERMARK_SUFFIX)
         process_add_watermark(user_id, state, image_path=image_path)
     except Exception as e:
         print(f"Error downloading watermark photo: {e}")
