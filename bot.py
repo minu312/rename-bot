@@ -150,7 +150,7 @@ def get_safe_image_suffix(file_name, mime_type=None):
 def is_supported_image_document(document):
     mime_type = (document.mime_type or "").lower()
     file_name = (document.file_name or "").lower()
-    return mime_type.startswith("image/") or file_name.endswith((".png", ".jpg", ".jpeg", ".webp"))
+    return mime_type.startswith("image/") or file_name.endswith(SUPPORTED_IMAGE_SUFFIXES)
 
 
 def download_telegram_file(file_id, suffix):
@@ -185,7 +185,7 @@ def add_text_watermark(doc, watermark_text, layout):
             rect.height * TEXT_WATERMARK_BOTTOM_RATIO,
         )
         base_font_size = int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)
-        text_length = len(watermark_text)
+        text_length = max(1, len(watermark_text))
         if text_length > TEXT_WATERMARK_OPTIMAL_CHARACTER_COUNT:
             base_font_size = int(base_font_size * TEXT_WATERMARK_OPTIMAL_CHARACTER_COUNT / text_length)
         font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, base_font_size))
@@ -417,6 +417,10 @@ def handle_photo(message):
     state = user_states.get(user_id)
     if not state or state.get('awaiting') != 'watermark_image_upload':
         bot.reply_to(message, "Please send a PDF file first and choose 'Add Watermark'.")
+        return
+
+    if not message.photo:
+        bot.reply_to(message, "Please upload a valid image photo.")
         return
 
     try:
