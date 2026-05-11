@@ -12,7 +12,7 @@ TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 PDF_SAVE_GARBAGE_LEVEL = 3
-RANDOM_WATERMARK_PROBABILITY_DENOMINATOR = 3
+RANDOM_WATERMARK_PAGE_INTERVAL = 3
 TEXT_WATERMARK_HORIZONTAL_MARGIN_RATIO = 0.12
 TEXT_WATERMARK_TOP_RATIO = 0.42
 TEXT_WATERMARK_BOTTOM_RATIO = 0.58
@@ -24,6 +24,7 @@ IMAGE_WATERMARK_HEIGHT_RATIO = 0.22
 MAX_IMAGE_SUFFIX_LENGTH = 10
 TELEGRAM_PHOTO_DEFAULT_SUFFIX = ".jpg"
 TEXT_WATERMARK_OPTIMAL_CHARACTER_COUNT = 40
+TEXT_WATERMARK_COLOR = (0.75, 0.75, 0.75)
 SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 IMAGE_MIME_SUFFIX_MAP = {
     "image/png": ".png",
@@ -166,8 +167,8 @@ def get_target_page_indexes(doc, layout):
     if page_count <= 0:
         return []
     if layout == "random":
-        offset = random.randint(0, RANDOM_WATERMARK_PROBABILITY_DENOMINATOR - 1)
-        random_pages = [i for i in range(page_count) if i % RANDOM_WATERMARK_PROBABILITY_DENOMINATOR == offset]
+        offset = random.randint(0, RANDOM_WATERMARK_PAGE_INTERVAL - 1)
+        random_pages = [i for i in range(page_count) if i % RANDOM_WATERMARK_PAGE_INTERVAL == offset]
         return random_pages or [0]
     return list(range(page_count))
 
@@ -184,7 +185,7 @@ def add_text_watermark(doc, watermark_text, layout):
             rect.height * TEXT_WATERMARK_BOTTOM_RATIO,
         )
         base_font_size = int(rect.width / TEXT_WATERMARK_FONT_DIVISOR)
-        text_length = max(1, len(watermark_text))
+        text_length = len(watermark_text)
         if text_length > TEXT_WATERMARK_OPTIMAL_CHARACTER_COUNT:
             base_font_size = int(base_font_size * TEXT_WATERMARK_OPTIMAL_CHARACTER_COUNT / text_length)
         font_size = max(TEXT_WATERMARK_FONT_MIN, min(TEXT_WATERMARK_FONT_MAX, base_font_size))
@@ -192,7 +193,7 @@ def add_text_watermark(doc, watermark_text, layout):
             box,
             watermark_text,
             fontsize=font_size,
-            color=(0.75, 0.75, 0.75),
+            color=TEXT_WATERMARK_COLOR,
             align=1,
             overlay=True,
         )
@@ -222,6 +223,8 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
         doc = fitz.open(source_path)
         if doc.needs_pass:
             state['awaiting'] = None
+            state['watermark_type'] = None
+            state['watermark_layout'] = None
             bot.send_message(user_id, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
             return
 
@@ -233,6 +236,9 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
         elif watermark_type == 'image':
             add_image_watermark(doc, image_path, watermark_layout)
         else:
+            state['awaiting'] = None
+            state['watermark_type'] = None
+            state['watermark_layout'] = None
             bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
             return
 
