@@ -174,7 +174,7 @@ def build_action_keyboard(include_bulk_saved=False):
     keyboard.row(types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"))
     keyboard.row(types.InlineKeyboardButton("Add Watermark", callback_data="add_watermark"))
     if include_bulk_saved:
-        keyboard.row(types.InlineKeyboardButton("Use Saved Watermark", callback_data="bulk_watermark_saved"))
+        keyboard.row(types.InlineKeyboardButton("Use Saved Watermark", callback_data="use_saved_watermark"))
     keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
     return keyboard
 
@@ -423,7 +423,7 @@ def process_bulk_saved_watermark(user_id, state):
         except Exception as e:
             print(f"Bulk watermark failed for {original_name} ({type(e).__name__}): {e}")
             failed_count += 1
-            bot.send_message(user_id, f"Failed to process: {original_name}")
+            bot.send_message(user_id, f"Failed to apply saved watermark: {original_name}")
         finally:
             if output_path:
                 delete_file(output_path)
@@ -639,7 +639,7 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
         except Exception as e:
             print(f"Error adding watermark for {original_name}: {e}")
             failed_count += 1
-            bot.send_message(user_id, f"Failed to process: {original_name}")
+            bot.send_message(user_id, f"Failed to add watermark to: {original_name}")
         finally:
             if doc:
                 try:
@@ -728,7 +728,7 @@ def handle_document(message):
     upsert_queue_action_menu(user_id, state)
 
 
-@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "bulk_watermark_saved"))
+@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "use_saved_watermark"))
 def handle_action_choice(call):
     user_id = call.from_user.id
     delete_callback_message(call)
@@ -745,7 +745,7 @@ def handle_action_choice(call):
     state = user_states[user_id]
     clear_action_menu_state(state)
 
-    if call.data == "bulk_watermark_saved":
+    if call.data == "use_saved_watermark":
         bot.answer_callback_query(call.id)
         process_bulk_saved_watermark(user_id, state)
         return
@@ -910,13 +910,13 @@ def handle_text(message):
         pdf_queue = list(get_pdf_queue(state))
         output_name = normalize_pdf_filename(requested_name)
         name_root, ext = os.path.splitext(output_name)
-        use_counter = len(pdf_queue) > 1
+        append_index_suffix = len(pdf_queue) > 1
         processed_count = 0
         failed_count = 0
         user_info = state.get('user_info')
         for index, pdf_item in enumerate(pdf_queue, start=1):
             source_path = pdf_item.get('source_path')
-            current_output_name = output_name if not use_counter else f"{name_root}_{index}{ext}"
+            current_output_name = output_name if not append_index_suffix else f"{name_root}_{index}{ext}"
             try:
                 if not source_path or not os.path.exists(source_path):
                     raise FileNotFoundError("Source PDF not found")
@@ -925,7 +925,7 @@ def handle_text(message):
             except Exception as e:
                 print(f"Error renaming PDF to {current_output_name}: {e}")
                 failed_count += 1
-                bot.reply_to(message, f"Failed to rename: {pdf_item.get('original_name') or 'document.pdf'}")
+                bot.send_message(user_id, f"Failed to rename: {pdf_item.get('original_name') or 'document.pdf'}")
             finally:
                 if source_path:
                     delete_file(source_path)
@@ -963,7 +963,7 @@ def handle_text(message):
             except Exception as e:
                 print(f"Error unlocking {original_name}: {e}")
                 failed_count += 1
-                bot.reply_to(message, f"Failed to unlock: {original_name}")
+                bot.send_message(user_id, f"Failed to unlock: {original_name}")
             finally:
                 if doc:
                     try:
@@ -1093,7 +1093,7 @@ def handle_text(message):
             except Exception as e:
                 print(f"Error removing watermark from {original_name}: {e}")
                 failed_count += 1
-                bot.reply_to(message, f"Failed to remove watermark: {original_name}")
+                bot.send_message(user_id, f"Failed to remove watermark: {original_name}")
             finally:
                 if doc:
                     try:
