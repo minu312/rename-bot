@@ -145,15 +145,9 @@ def upsert_queue_action_menu(user_id, state):
     action_menu_message_id = state.get('action_menu_message_id')
     if action_menu_message_id:
         try:
-            bot.edit_message_text(
-                menu_text,
-                chat_id=user_id,
-                message_id=action_menu_message_id,
-                reply_markup=reply_markup,
-            )
-            return
+            bot.delete_message(user_id, action_menu_message_id)
         except Exception as e:
-            print(f"Failed to update existing action menu: {e}")
+            print(f"Failed to delete previous action menu: {e}")
 
     try:
         sent = bot.send_message(user_id, menu_text, reply_markup=reply_markup)
