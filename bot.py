@@ -241,6 +241,16 @@ def build_saved_watermark_image_path(profile):
     return image_path
 
 
+def is_valid_saved_watermark_profile(profile):
+    if not profile or profile.get('type') not in ('text', 'image'):
+        return False
+    if profile.get('type') == 'text':
+        return bool((profile.get('text') or '').strip())
+    if profile.get('type') == 'image':
+        return bool(profile.get('image_bytes'))
+    return False
+
+
 def get_or_create_user_state(user_id, user_info=None):
     state = user_states.get(user_id)
     if not state:
@@ -338,8 +348,8 @@ def process_saved_watermark_profile_for_pdf(source_path, profile):
 
 def process_bulk_saved_watermark(user_id, state):
     profile = saved_watermarks.get(user_id)
-    if not profile:
-        bot.send_message(user_id, "No saved watermark was found. Please create one first.")
+    if not is_valid_saved_watermark_profile(profile):
+        bot.send_message(user_id, "Saved watermark data is incomplete. Please create it again.")
         return
 
     pdf_queue = list(state.get('pdf_queue') or [])
@@ -366,7 +376,7 @@ def process_bulk_saved_watermark(user_id, state):
             )
             processed_count += 1
         except Exception as e:
-            print(f"Bulk watermark failed for {original_name}: {e}")
+            print(f"Bulk watermark failed for {original_name} ({type(e).__name__}): {e}")
             failed_count += 1
             bot.send_message(user_id, f"Failed to process: {original_name}")
         finally:
