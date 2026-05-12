@@ -8,14 +8,20 @@ import atexit
 import re
 import random
 import threading
+import sqlite3
+import time
+from datetime import datetime, timezone
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 INCOMING_BACKUP_GROUP_ID_STR = os.environ.get('INCOMING_BACKUP_GROUP_ID', '').strip()
 OUTGOING_BACKUP_GROUP_ID_STR = os.environ.get('OUTGOING_BACKUP_GROUP_ID', '').strip()
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_database.db")
 PDF_SAVE_GARBAGE_LEVEL = 3
 MAX_BULK_QUEUE_SIZE = 50
+FREE_PDF_WEEKLY_LIMIT = 2
+WEEKLY_RESET_SECONDS = 604800
 RANDOM_WATERMARK_PAGE_INTERVAL = 3
 MIN_WATERMARK_TRANSPARENCY_PERCENT = 1
 MIN_WATERMARK_OPACITY = MIN_WATERMARK_TRANSPARENCY_PERCENT / 100.0
@@ -69,6 +75,7 @@ user_states = {}
 saved_watermarks = {}
 state_lock = threading.Lock()
 user_locks = {}
+db_lock = threading.Lock()
 
 
 def get_user_lock(user_id):
@@ -76,6 +83,142 @@ def get_user_lock(user_id):
         if user_id not in user_locks:
             user_locks[user_id] = threading.Lock()
         return user_locks[user_id]
+
+
+def get_db_connection():
+    return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+
+
+def initialize_database():
+    with db_lock:
+        connection = get_db_connection()
+        try:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    is_premium BOOLEAN DEFAULT 0,
+                    pdfs_processed INTEGER DEFAULT 0,
+                    last_reset_timestamp REAL
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def get_user_plan_info(user_id):
+    now = time.time()
+    with db_lock:
+        connection = get_db_connection()
+        try:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
+                VALUES (?, 0, 0, ?)
+                """,
+                (user_id, now),
+            )
+            cursor = connection.execute(
+                "SELECT is_premium, pdfs_processed, last_reset_timestamp FROM users WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            is_premium = bool(row[0]) if row else False
+            pdfs_processed = int(row[1]) if row else 0
+            last_reset_timestamp = float(row[2]) if row and row[2] is not None else now
+
+            if not is_premium and now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
+                pdfs_processed = 0
+                last_reset_timestamp = now
+                connection.execute(
+                    "UPDATE users SET pdfs_processed = ?, last_reset_timestamp = ? WHERE user_id = ?",
+                    (pdfs_processed, last_reset_timestamp, user_id),
+                )
+            elif row and row[2] is None:
+                connection.execute(
+                    "UPDATE users SET last_reset_timestamp = ? WHERE user_id = ?",
+                    (last_reset_timestamp, user_id),
+                )
+
+            connection.commit()
+            return {
+                'is_premium': is_premium,
+                'pdfs_processed': pdfs_processed,
+                'last_reset_timestamp': last_reset_timestamp,
+            }
+        finally:
+            connection.close()
+
+
+def increment_processed_pdf_count(user_id):
+    now = time.time()
+    with db_lock:
+        connection = get_db_connection()
+        try:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
+                VALUES (?, 0, 0, ?)
+                """,
+                (user_id, now),
+            )
+            cursor = connection.execute(
+                "SELECT is_premium, pdfs_processed, last_reset_timestamp FROM users WHERE user_id = ?",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                connection.commit()
+                return
+
+            is_premium = bool(row[0])
+            if is_premium:
+                connection.commit()
+                return
+
+            pdfs_processed = int(row[1] or 0)
+            last_reset_timestamp = float(row[2]) if row[2] is not None else now
+            if now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
+                pdfs_processed = 0
+                last_reset_timestamp = now
+
+            pdfs_processed += 1
+            connection.execute(
+                "UPDATE users SET pdfs_processed = ?, last_reset_timestamp = ? WHERE user_id = ?",
+                (pdfs_processed, last_reset_timestamp, user_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+
+def set_premium_status(user_id, is_premium):
+    now = time.time()
+    with db_lock:
+        connection = get_db_connection()
+        try:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
+                VALUES (?, 0, 0, ?)
+                """,
+                (user_id, now),
+            )
+            if is_premium:
+                connection.execute(
+                    "UPDATE users SET is_premium = 1 WHERE user_id = ?",
+                    (user_id,),
+                )
+            else:
+                connection.execute(
+                    "UPDATE users SET is_premium = 0, pdfs_processed = 0, last_reset_timestamp = ? WHERE user_id = ?",
+                    (now, user_id),
+                )
+            connection.commit()
+        finally:
+            connection.close()
 
 
 def cleanup_storage_dir():
@@ -246,6 +389,7 @@ def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
 def send_processed_pdf(user_id, output_path, output_name, user_info=None):
     with open(output_path, 'rb') as final_file:
         bot.send_document(user_id, final_file, visible_file_name=output_name)
+    increment_processed_pdf_count(user_id)
     send_backup_pdf(output_path, output_name, user_info, "Processed PDF", OUTGOING_BACKUP_GROUP_ID)
 
 
@@ -661,6 +805,7 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
         delete_file(image_path)
 
 
+initialize_database()
 atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
@@ -672,6 +817,73 @@ def send_welcome(message):
         return
     print(f"User {message.from_user.id} is allowed. Sending welcome message.")
     bot.reply_to(message, "Send me a PDF file to process.")
+
+
+@bot.message_handler(commands=['addpremium'])
+def add_premium(message):
+    admin_user_id = message.from_user.id
+    if admin_user_id not in ALLOWED_USERS:
+        bot.reply_to(message, "Sorry, you are not authorized to use this command.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /addpremium <user_id>")
+        return
+
+    try:
+        target_user_id = int(parts[1].strip())
+    except ValueError:
+        bot.reply_to(message, "Usage: /addpremium <user_id>")
+        return
+
+    set_premium_status(target_user_id, True)
+    bot.reply_to(message, f"Premium enabled for user {target_user_id}.")
+
+
+@bot.message_handler(commands=['removepremium'])
+def remove_premium(message):
+    admin_user_id = message.from_user.id
+    if admin_user_id not in ALLOWED_USERS:
+        bot.reply_to(message, "Sorry, you are not authorized to use this command.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2:
+        bot.reply_to(message, "Usage: /removepremium <user_id>")
+        return
+
+    try:
+        target_user_id = int(parts[1].strip())
+    except ValueError:
+        bot.reply_to(message, "Usage: /removepremium <user_id>")
+        return
+
+    set_premium_status(target_user_id, False)
+    bot.reply_to(message, f"Premium removed for user {target_user_id}.")
+
+
+@bot.message_handler(commands=['myplan'])
+def my_plan(message):
+    user_id = message.from_user.id
+    if user_id not in ALLOWED_USERS:
+        bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
+        return
+
+    plan = get_user_plan_info(user_id)
+    if plan['is_premium']:
+        bot.reply_to(message, "Status: Premium 👑 (Unlimited PDFs)")
+        return
+
+    reset_at = datetime.fromtimestamp(
+        plan['last_reset_timestamp'] + WEEKLY_RESET_SECONDS,
+        tz=timezone.utc,
+    )
+    reset_at_text = reset_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    bot.reply_to(
+        message,
+        f"Status: Free 🆓\nPDFs processed this week: {plan['pdfs_processed']}/{FREE_PDF_WEEKLY_LIMIT}\nResets on: {reset_at_text}",
+    )
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
@@ -710,6 +922,17 @@ def handle_document(message):
         print("Not a valid PDF.")
         bot.reply_to(message, "Please send a valid PDF file.")
         return
+
+    with user_lock:
+        state = get_or_create_user_state(user_id, user_info)
+        queue_count = len(get_pdf_queue(state))
+        plan = get_user_plan_info(user_id)
+        if not plan['is_premium'] and (plan['pdfs_processed'] + queue_count) >= FREE_PDF_WEEKLY_LIMIT:
+            bot.reply_to(
+                message,
+                "You have reached your free limit of 2 PDFs per week. Please purchase Premium to continue.",
+            )
+            return
 
     original_name = message.document.file_name or "document.pdf"
     source_path = new_private_pdf_path()
