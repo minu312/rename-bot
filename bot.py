@@ -14,6 +14,7 @@ INCOMING_BACKUP_GROUP_ID_STR = os.environ.get('INCOMING_BACKUP_GROUP_ID', '').st
 OUTGOING_BACKUP_GROUP_ID_STR = os.environ.get('OUTGOING_BACKUP_GROUP_ID', '').strip()
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 PDF_SAVE_GARBAGE_LEVEL = 3
+MAX_BULK_QUEUE_SIZE = 50
 RANDOM_WATERMARK_PAGE_INTERVAL = 3
 MIN_WATERMARK_TRANSPARENCY_PERCENT = 1
 MIN_WATERMARK_OPACITY = MIN_WATERMARK_TRANSPARENCY_PERCENT / 100.0
@@ -106,17 +107,29 @@ def clear_user_state(user_id, delete_source=False):
     state = user_states.get(user_id)
     if not state:
         return
+    queued_pdfs = state.get('pdf_queue') or []
     reset_watermark_state(state, delete_pending_image=True)
     if delete_source:
-        delete_file(state.get('source_path'))
+        unique_paths = set()
+        for pdf_item in queued_pdfs:
+            source_path = pdf_item.get('source_path')
+            if source_path:
+                unique_paths.add(source_path)
+        active_source_path = state.get('source_path')
+        if active_source_path:
+            unique_paths.add(active_source_path)
+        for source_path in unique_paths:
+            delete_file(source_path)
     user_states.pop(user_id, None)
 
 
-def build_action_keyboard():
+def build_action_keyboard(include_bulk_saved=False):
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(types.InlineKeyboardButton("Rename PDF", callback_data="rename_pdf"))
     keyboard.row(types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"))
     keyboard.row(types.InlineKeyboardButton("Add Watermark", callback_data="add_watermark"))
+    if include_bulk_saved:
+        keyboard.row(types.InlineKeyboardButton("Bulk Watermark (Use Saved)", callback_data="bulk_watermark_saved"))
     keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
     return keyboard
 
@@ -228,6 +241,45 @@ def build_saved_watermark_image_path(profile):
     return image_path
 
 
+def is_valid_saved_watermark_profile(profile):
+    if not profile or profile.get('type') not in ('text', 'image'):
+        return False
+    if profile.get('type') == 'text':
+        return bool((profile.get('text') or '').strip())
+    if profile.get('type') == 'image':
+        return bool(profile.get('image_bytes'))
+    return False
+
+
+def get_or_create_user_state(user_id, user_info=None):
+    state = user_states.get(user_id)
+    if not state:
+        state = {
+            'awaiting': None,
+            'pdf_queue': [],
+        }
+        user_states[user_id] = state
+    if 'pdf_queue' not in state:
+        state['pdf_queue'] = []
+    if user_info:
+        state['user_info'] = user_info
+    return state
+
+
+def enqueue_pdf_for_user(state, source_path, original_name):
+    pdf_queue = state.setdefault('pdf_queue', [])
+    if len(pdf_queue) >= MAX_BULK_QUEUE_SIZE:
+        return False, len(pdf_queue)
+    pdf_item = {
+        'source_path': source_path,
+        'original_name': original_name,
+    }
+    pdf_queue.append(pdf_item)
+    state['source_path'] = source_path
+    state['original_name'] = original_name
+    return True, len(pdf_queue)
+
+
 def apply_saved_watermark(user_id, state):
     profile = saved_watermarks.get(user_id)
     if not profile:
@@ -254,6 +306,87 @@ def apply_saved_watermark(user_id, state):
         return
 
     bot.send_message(user_id, "Saved watermark data is incomplete. Please create it again.")
+
+
+def process_saved_watermark_profile_for_pdf(source_path, profile):
+    output_path = None
+    doc = None
+    image_path = None
+    try:
+        doc = fitz.open(source_path)
+        if doc.needs_pass:
+            raise ValueError("PDF is password protected")
+
+        watermark_type = profile.get('type')
+        watermark_layout = profile.get('layout', 'every')
+        watermark_transparency = profile.get('transparency', 100)
+        watermark_orientation = profile.get('orientation', 'horizontal')
+
+        if watermark_type == 'text':
+            watermark_text = profile.get('text', '')
+            if not watermark_text:
+                raise ValueError("Saved text watermark is empty")
+            add_text_watermark(doc, watermark_text, watermark_layout, watermark_transparency, watermark_orientation)
+        elif watermark_type == 'image':
+            image_path = build_saved_watermark_image_path(profile)
+            add_image_watermark(doc, image_path, watermark_layout, watermark_transparency)
+        else:
+            raise ValueError("Saved watermark type is invalid")
+
+        output_path = new_private_pdf_path()
+        doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+        return output_path
+    finally:
+        if doc:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if image_path:
+            delete_file(image_path)
+
+
+def process_bulk_saved_watermark(user_id, state):
+    profile = saved_watermarks.get(user_id)
+    if not is_valid_saved_watermark_profile(profile):
+        bot.send_message(user_id, "Saved watermark data is incomplete. Please create it again.")
+        return
+
+    pdf_queue = list(state.get('pdf_queue') or [])
+    if not pdf_queue:
+        bot.send_message(user_id, "No PDFs found in your queue. Please upload PDFs first.")
+        return
+
+    processed_count = 0
+    failed_count = 0
+    user_info = state.get('user_info')
+    for pdf_item in pdf_queue:
+        source_path = pdf_item.get('source_path')
+        original_name = pdf_item.get('original_name') or "document.pdf"
+        output_path = None
+        try:
+            if not source_path or not os.path.exists(source_path):
+                raise FileNotFoundError("Source PDF not found")
+            output_path = process_saved_watermark_profile_for_pdf(source_path, profile)
+            send_processed_pdf(
+                user_id,
+                output_path,
+                build_output_name(original_name, "watermarked"),
+                user_info=user_info,
+            )
+            processed_count += 1
+        except Exception as e:
+            print(f"Bulk watermark failed for {original_name} ({type(e).__name__}): {e}")
+            failed_count += 1
+            bot.send_message(user_id, f"Failed to process: {original_name}")
+        finally:
+            if output_path:
+                delete_file(output_path)
+            if source_path:
+                delete_file(source_path)
+
+    clear_user_state(user_id, delete_source=False)
+    bot.send_message(user_id, f"Bulk processing completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
 
 
 def build_output_name(original_name, suffix):
@@ -486,7 +619,7 @@ def handle_document(message):
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
         return
 
-    state = user_states.get(user_id)
+    state = get_or_create_user_state(user_id, extract_user_info(message.from_user))
     if state and state.get('awaiting') == 'watermark_image_upload':
         if not is_supported_image_document(message.document):
             bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
@@ -511,8 +644,6 @@ def handle_document(message):
         bot.reply_to(message, "Please send a valid PDF file.")
         return
 
-    clear_user_state(user_id, delete_source=True)
-
     original_name = message.document.file_name or "document.pdf"
     source_path = new_private_pdf_path()
 
@@ -527,18 +658,22 @@ def handle_document(message):
         delete_file(source_path)
         return
 
-    user_states[user_id] = {
-        'source_path': source_path,
-        'original_name': original_name,
-        'awaiting': None,
-        'user_info': extract_user_info(message.from_user),
-    }
-    send_backup_pdf(source_path, original_name, user_states[user_id]['user_info'], "Original PDF", INCOMING_BACKUP_GROUP_ID)
-    print(f"PDF accepted from {user_id}. Waiting for action choice.")
-    bot.reply_to(message, "Choose an action for this PDF:", reply_markup=build_action_keyboard())
+    queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
+    if not queued:
+        bot.reply_to(message, f"Queue is full (max {MAX_BULK_QUEUE_SIZE} PDFs). Please process current batch first.")
+        delete_file(source_path)
+        return
+
+    send_backup_pdf(source_path, original_name, state.get('user_info'), "Original PDF", INCOMING_BACKUP_GROUP_ID)
+    print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
+    bot.reply_to(
+        message,
+        f"PDF added to queue ({queue_count}/{MAX_BULK_QUEUE_SIZE}). Upload more PDFs or choose an action.",
+        reply_markup=build_action_keyboard(include_bulk_saved=user_id in saved_watermarks),
+    )
 
 
-@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark"))
+@bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "bulk_watermark_saved"))
 def handle_action_choice(call):
     user_id = call.from_user.id
     delete_callback_message(call)
@@ -553,6 +688,11 @@ def handle_action_choice(call):
         return
 
     state = user_states[user_id]
+
+    if call.data == "bulk_watermark_saved":
+        bot.answer_callback_query(call.id)
+        process_bulk_saved_watermark(user_id, state)
+        return
 
     if call.data == "rename_pdf":
         reset_watermark_state(state, delete_pending_image=True)
