@@ -7,6 +7,7 @@ import shutil
 import atexit
 import re
 import random
+import threading
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
@@ -66,6 +67,7 @@ except Exception as e:
 bot = telebot.TeleBot(TOKEN)
 user_states = {}
 saved_watermarks = {}
+state_lock = threading.Lock()
 
 
 def cleanup_storage_dir():
@@ -711,7 +713,10 @@ def handle_document(message):
         delete_file(source_path)
         return
 
-    queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
+    with state_lock:
+        queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
+        if queued:
+            upsert_queue_action_menu(user_id, state)
     if not queued:
         bot.reply_to(message, f"Queue is full (max {MAX_BULK_QUEUE_SIZE} PDFs). Please process current batch first.")
         delete_file(source_path)
@@ -719,7 +724,6 @@ def handle_document(message):
 
     send_backup_pdf(source_path, original_name, state.get('user_info'), "Original PDF", INCOMING_BACKUP_GROUP_ID)
     print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
-    upsert_queue_action_menu(user_id, state)
 
 
 @bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "use_saved_watermark"))
