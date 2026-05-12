@@ -123,13 +123,58 @@ def clear_user_state(user_id, delete_source=False):
     user_states.pop(user_id, None)
 
 
+def get_pdf_queue(state):
+    return state.get('pdf_queue') or []
+
+
+def has_pdf_queue(state):
+    return bool(get_pdf_queue(state))
+
+
+def build_queue_status_text(queue_count):
+    return f"Received {queue_count} PDF(s). Send more if you want, then choose an action below:"
+
+
+def upsert_queue_action_menu(user_id, state):
+    queue_count = len(get_pdf_queue(state))
+    if queue_count <= 0:
+        return
+
+    menu_text = build_queue_status_text(queue_count)
+    reply_markup = build_action_keyboard(include_bulk_saved=user_id in saved_watermarks)
+    action_menu_message_id = state.get('action_menu_message_id')
+    if action_menu_message_id:
+        try:
+            bot.edit_message_text(
+                menu_text,
+                chat_id=user_id,
+                message_id=action_menu_message_id,
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception as e:
+            print(f"Failed to update existing action menu: {e}")
+
+    try:
+        sent = bot.send_message(user_id, menu_text, reply_markup=reply_markup)
+        state['action_menu_message_id'] = sent.message_id
+    except Exception as e:
+        print(f"Failed to send action menu: {e}")
+
+
+def clear_action_menu_state(state):
+    if not state:
+        return
+    state.pop('action_menu_message_id', None)
+
+
 def build_action_keyboard(include_bulk_saved=False):
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(types.InlineKeyboardButton("Rename PDF", callback_data="rename_pdf"))
     keyboard.row(types.InlineKeyboardButton("Remove Watermark", callback_data="remove_watermark"))
     keyboard.row(types.InlineKeyboardButton("Add Watermark", callback_data="add_watermark"))
     if include_bulk_saved:
-        keyboard.row(types.InlineKeyboardButton("Bulk Watermark (Use Saved)", callback_data="bulk_watermark_saved"))
+        keyboard.row(types.InlineKeyboardButton("Use Saved Watermark", callback_data="bulk_watermark_saved"))
     keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
     return keyboard
 
@@ -537,65 +582,79 @@ def add_image_watermark(doc, image_path, layout, transparency):
 
 
 def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
-    source_path = state['source_path']
-    output_path = None
-    doc = None
+    pdf_queue = list(get_pdf_queue(state))
+    if not pdf_queue:
+        bot.send_message(user_id, "No PDFs found in your queue. Please upload PDFs first.")
+        return
 
-    try:
-        doc = fitz.open(source_path)
-        if doc.needs_pass:
-            reset_watermark_state(state, delete_pending_image=True)
-            bot.send_message(user_id, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
-            return
+    watermark_type = state.get('watermark_type')
+    watermark_layout = state.get('watermark_layout', 'every')
+    watermark_transparency = state.get('watermark_transparency', 100)
+    watermark_orientation = state.get('watermark_orientation', 'horizontal')
+    watermark_text = watermark_text if watermark_text is not None else state.get('pending_watermark_text')
+    image_path = image_path or state.get('pending_watermark_image_path')
 
-        watermark_type = state.get('watermark_type')
-        watermark_layout = state.get('watermark_layout', 'every')
-        watermark_transparency = state.get('watermark_transparency', 100)
-        watermark_orientation = state.get('watermark_orientation', 'horizontal')
-        watermark_text = watermark_text if watermark_text is not None else state.get('pending_watermark_text')
-        image_path = image_path or state.get('pending_watermark_image_path')
+    if watermark_type == 'text' and not watermark_text:
+        reset_watermark_state(state, delete_pending_image=True)
+        bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
+        return
+    if watermark_type == 'image' and not image_path:
+        reset_watermark_state(state, delete_pending_image=True)
+        bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
+        return
+    if watermark_type not in ('text', 'image'):
+        reset_watermark_state(state, delete_pending_image=True)
+        bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
+        return
 
-        if watermark_type == 'text':
-            if not watermark_text:
-                reset_watermark_state(state, delete_pending_image=True)
-                bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
-                return
-            add_text_watermark(doc, watermark_text, watermark_layout, watermark_transparency, watermark_orientation)
-        elif watermark_type == 'image':
-            if not image_path:
-                reset_watermark_state(state, delete_pending_image=True)
-                bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
-                return
-            add_image_watermark(doc, image_path, watermark_layout, watermark_transparency)
-        else:
-            reset_watermark_state(state, delete_pending_image=True)
-            bot.send_message(user_id, "Watermark settings are incomplete. Please choose the action again.", reply_markup=build_action_keyboard())
-            return
+    processed_count = 0
+    failed_count = 0
+    user_info = state.get('user_info')
+    for pdf_item in pdf_queue:
+        source_path = pdf_item.get('source_path')
+        original_name = pdf_item.get('original_name') or "document.pdf"
+        output_path = None
+        doc = None
+        try:
+            if not source_path or not os.path.exists(source_path):
+                raise FileNotFoundError("Source PDF not found")
+            doc = fitz.open(source_path)
+            if doc.needs_pass:
+                raise ValueError("PDF is password protected")
 
-        output_path = new_private_pdf_path()
-        doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
-        send_processed_pdf(
-            user_id,
-            output_path,
-            build_output_name(state.get('original_name'), "watermarked"),
-            user_info=state.get('user_info'),
-        )
-        delete_file(output_path)
-        clear_user_state(user_id, delete_source=True)
-        print("Watermarked PDF sent successfully.")
-    except Exception as e:
-        print(f"Error adding watermark: {e}")
-        bot.send_message(user_id, "Failed to add watermark. Please try again.")
-        if output_path:
-            delete_file(output_path)
-    finally:
-        if doc:
-            try:
-                doc.close()
-            except Exception:
-                pass
-        if image_path:
-            delete_file(image_path)
+            if watermark_type == 'text':
+                add_text_watermark(doc, watermark_text, watermark_layout, watermark_transparency, watermark_orientation)
+            else:
+                add_image_watermark(doc, image_path, watermark_layout, watermark_transparency)
+
+            output_path = new_private_pdf_path()
+            doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+            send_processed_pdf(
+                user_id,
+                output_path,
+                build_output_name(original_name, "watermarked"),
+                user_info=user_info,
+            )
+            processed_count += 1
+        except Exception as e:
+            print(f"Error adding watermark for {original_name}: {e}")
+            failed_count += 1
+            bot.send_message(user_id, f"Failed to process: {original_name}")
+        finally:
+            if doc:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+            if output_path:
+                delete_file(output_path)
+            if source_path:
+                delete_file(source_path)
+
+    clear_user_state(user_id, delete_source=False)
+    bot.send_message(user_id, f"Batch watermark completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+    if image_path:
+        delete_file(image_path)
 
 
 atexit.register(cleanup_storage_dir)
@@ -666,11 +725,7 @@ def handle_document(message):
 
     send_backup_pdf(source_path, original_name, state.get('user_info'), "Original PDF", INCOMING_BACKUP_GROUP_ID)
     print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
-    bot.reply_to(
-        message,
-        f"PDF added to queue ({queue_count}/{MAX_BULK_QUEUE_SIZE}). Upload more PDFs or choose an action.",
-        reply_markup=build_action_keyboard(include_bulk_saved=user_id in saved_watermarks),
-    )
+    upsert_queue_action_menu(user_id, state)
 
 
 @bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "bulk_watermark_saved"))
@@ -682,12 +737,13 @@ def handle_action_choice(call):
         bot.answer_callback_query(call.id, "Not authorized.")
         return
 
-    if user_id not in user_states or not user_states[user_id].get('source_path'):
+    if user_id not in user_states or not has_pdf_queue(user_states[user_id]):
         bot.answer_callback_query(call.id, "Please send a PDF first.")
         bot.send_message(user_id, "Please send a PDF file first.")
         return
 
     state = user_states[user_id]
+    clear_action_menu_state(state)
 
     if call.data == "bulk_watermark_saved":
         bot.answer_callback_query(call.id)
@@ -747,7 +803,7 @@ def handle_add_watermark_choices(call):
         return
 
     state = user_states.get(user_id)
-    if not state or not state.get('source_path'):
+    if not state or not has_pdf_queue(state):
         bot.answer_callback_query(call.id, "Please send a PDF first.")
         bot.send_message(user_id, "Please send a PDF file first.")
         return
@@ -839,209 +895,220 @@ def handle_text(message):
         return
 
     state = user_states.get(user_id)
-    if not state or not state.get('source_path'):
+    if not state or not has_pdf_queue(state):
         bot.reply_to(message, "Please send a PDF file first.")
         return
 
     awaiting = state.get('awaiting')
     if awaiting == 'new_name':
-        source_path = state['source_path']
         requested_name = (message.text or "").strip()
 
         if not requested_name:
             bot.reply_to(message, "File name cannot be empty. Please send a valid name.")
             return
 
+        pdf_queue = list(get_pdf_queue(state))
         output_name = normalize_pdf_filename(requested_name)
-        output_path = os.path.join(STORAGE_DIR, output_name)
         name_root, ext = os.path.splitext(output_name)
-        counter = 1
-        while os.path.exists(output_path):
-            output_name = f"{name_root}_{counter}{ext}"
-            output_path = os.path.join(STORAGE_DIR, output_name)
-            counter += 1
-
-        replaced = False
-        try:
-            os.replace(source_path, output_path)
-            replaced = True
-            send_processed_pdf(user_id, output_path, output_name, user_info=state.get('user_info'))
-            delete_file(output_path)
-            clear_user_state(user_id, delete_source=False)
-            print("Renamed PDF sent successfully.")
-            return
-        except Exception as e:
-            print(f"Error renaming PDF: {e}")
-            if replaced and os.path.exists(output_path):
-                try:
-                    os.replace(output_path, source_path)
-                except Exception as restore_error:
-                    print(f"Failed to restore source PDF after rename error: {restore_error}")
-                    clear_user_state(user_id, delete_source=False)
-            elif os.path.exists(output_path):
-                delete_file(output_path)
-            bot.reply_to(message, "Failed to rename PDF. Please try again.")
-            return
+        use_counter = len(pdf_queue) > 1
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for index, pdf_item in enumerate(pdf_queue, start=1):
+            source_path = pdf_item.get('source_path')
+            current_output_name = output_name if not use_counter else f"{name_root}_{index}{ext}"
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                send_processed_pdf(user_id, source_path, current_output_name, user_info=user_info)
+                processed_count += 1
+            except Exception as e:
+                print(f"Error renaming PDF to {current_output_name}: {e}")
+                failed_count += 1
+                bot.reply_to(message, f"Failed to rename: {pdf_item.get('original_name') or 'document.pdf'}")
+            finally:
+                if source_path:
+                    delete_file(source_path)
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch rename completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        print("Renamed PDF batch sent successfully.")
+        return
 
     if awaiting == 'password':
         password = message.text or ""
-        source_path = state['source_path']
-        output_path = None
-
-        try:
-            doc = fitz.open(source_path)
-            if not doc.needs_pass:
-                doc.close()
-                state['awaiting'] = None
-                bot.reply_to(message, "This PDF is not password protected. Choose another action or send a new PDF.", reply_markup=build_action_keyboard())
-                return
-
-            if not doc.authenticate(password):
-                doc.close()
-                state['awaiting'] = None
-                bot.reply_to(message, "Incorrect password. Choose an action and try again.", reply_markup=build_action_keyboard())
-                return
-
-            output_path = new_private_pdf_path()
-            doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
-            doc.close()
-            send_processed_pdf(
-                user_id,
-                output_path,
-                build_output_name(state.get('original_name'), "unlocked"),
-                user_info=state.get('user_info'),
-            )
-            delete_file(output_path)
-            clear_user_state(user_id, delete_source=True)
-            print("Unlocked PDF sent successfully.")
-            return
-        except Exception as e:
-            print(f"Error unlocking PDF: {e}")
-            bot.reply_to(message, "Failed to unlock PDF. Please verify the password and try again.")
-            if output_path:
-                delete_file(output_path)
-            return
+        pdf_queue = list(get_pdf_queue(state))
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for pdf_item in pdf_queue:
+            source_path = pdf_item.get('source_path')
+            original_name = pdf_item.get('original_name') or "document.pdf"
+            output_path = None
+            doc = None
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                doc = fitz.open(source_path)
+                if doc.needs_pass and not doc.authenticate(password):
+                    raise ValueError("Incorrect password")
+                output_path = new_private_pdf_path()
+                doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+                send_processed_pdf(
+                    user_id,
+                    output_path,
+                    build_output_name(original_name, "unlocked"),
+                    user_info=user_info,
+                )
+                processed_count += 1
+            except Exception as e:
+                print(f"Error unlocking {original_name}: {e}")
+                failed_count += 1
+                bot.reply_to(message, f"Failed to unlock: {original_name}")
+            finally:
+                if doc:
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+                if output_path:
+                    delete_file(output_path)
+                if source_path:
+                    delete_file(source_path)
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch unlock completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        print("Unlocked PDF batch sent successfully.")
+        return
 
     if awaiting == 'watermark_text':
         watermark_text = message.text or ""
-        source_path = state['source_path']
-        output_path = None
 
         if not watermark_text.strip():
             bot.reply_to(message, "Watermark text cannot be empty. Please send the exact text.")
             return
 
-        try:
-            doc = fitz.open(source_path)
-            if doc.needs_pass:
-                doc.close()
-                state['awaiting'] = None
-                bot.reply_to(message, "This PDF is password protected. Please use 'Unlock PDF' first.", reply_markup=build_action_keyboard())
-                return
+        target_variants = set()
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                raw = watermark_text.encode(encoding)
+                if raw:
+                    target_variants.add(raw)
+                    target_variants.add(
+                        raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+                    )
+            except Exception:
+                continue
 
-            target_variants = set()
-            for encoding in ("utf-8", "latin-1"):
-                try:
-                    raw = watermark_text.encode(encoding)
-                    if raw:
-                        target_variants.add(raw)
-                        target_variants.add(
-                            raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
-                        )
-                except Exception:
+        if not target_variants:
+            bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
+            return
+
+        def strip_from_literal_string(content_bytes):
+            removed = 0
+            updated = content_bytes
+            for target in target_variants:
+                if not target:
                     continue
+                updated, count = re.subn(re.escape(target), b"", updated)
+                removed += count
+            return updated, removed
 
-            if not target_variants:
-                doc.close()
-                state['awaiting'] = None
-                bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
-                return
+        pdf_queue = list(get_pdf_queue(state))
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for pdf_item in pdf_queue:
+            source_path = pdf_item.get('source_path')
+            original_name = pdf_item.get('original_name') or "document.pdf"
+            output_path = None
+            doc = None
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                doc = fitz.open(source_path)
+                if doc.needs_pass:
+                    raise ValueError("PDF is password protected")
 
-            def strip_from_literal_string(content_bytes):
-                removed = 0
-                updated = content_bytes
-                for target in target_variants:
-                    if not target:
-                        continue
-                    updated, count = re.subn(re.escape(target), b"", updated)
-                    removed += count
-                return updated, removed
+                matches = 0
+                processed_xrefs = set()
 
-            matches = 0
-            processed_xrefs = set()
+                for page in doc:
+                    content_xrefs = page.get_contents() or []
+                    if isinstance(content_xrefs, int):
+                        content_xrefs = [content_xrefs]
 
-            for page in doc:
-                content_xrefs = page.get_contents() or []
-                if isinstance(content_xrefs, int):
-                    content_xrefs = [content_xrefs]
+                    for xref in content_xrefs:
+                        if xref in processed_xrefs:
+                            continue
+                        processed_xrefs.add(xref)
 
-                for xref in content_xrefs:
-                    if xref in processed_xrefs:
-                        continue
-                    processed_xrefs.add(xref)
+                        stream = doc.xref_stream(xref)
+                        if not stream:
+                            continue
 
-                    stream = doc.xref_stream(xref)
-                    if not stream:
-                        continue
+                        stream_matches = 0
 
-                    stream_matches = 0
-
-                    def replace_tj(match):
-                        nonlocal stream_matches
-                        literal_body = match.group(1)
-                        suffix = match.group(2)
-                        updated_body, removed = strip_from_literal_string(literal_body)
-                        stream_matches += removed
-                        return b"(" + updated_body + b")" + suffix
-
-                    def replace_tj_array(match):
-                        nonlocal stream_matches
-                        array_body = match.group(1)
-                        suffix = match.group(2)
-
-                        def replace_array_string(s_match):
+                        def replace_tj(match):
                             nonlocal stream_matches
-                            literal = s_match.group(0)
-                            inner = literal[1:-1]
-                            updated_inner, removed = strip_from_literal_string(inner)
+                            literal_body = match.group(1)
+                            suffix = match.group(2)
+                            updated_body, removed = strip_from_literal_string(literal_body)
                             stream_matches += removed
-                            return b"(" + updated_inner + b")"
+                            return b"(" + updated_body + b")" + suffix
 
-                        updated_array = re.sub(rb"\((?:\\.|[^\\)])*\)", replace_array_string, array_body)
-                        return b"[" + updated_array + b"]" + suffix
+                        def replace_tj_array(match):
+                            nonlocal stream_matches
+                            array_body = match.group(1)
+                            suffix = match.group(2)
 
-                    modified_stream = re.sub(rb"\(((?:\\.|[^\\)])*)\)(\s*Tj)", replace_tj, stream)
-                    modified_stream = re.sub(rb"\[(.*?)\](\s*TJ)", replace_tj_array, modified_stream, flags=re.DOTALL)
+                            def replace_array_string(s_match):
+                                nonlocal stream_matches
+                                literal = s_match.group(0)
+                                inner = literal[1:-1]
+                                updated_inner, removed = strip_from_literal_string(inner)
+                                stream_matches += removed
+                                return b"(" + updated_inner + b")"
 
-                    if stream_matches > 0 and modified_stream != stream:
-                        doc.update_stream(xref, modified_stream)
-                        matches += stream_matches
+                            updated_array = re.sub(rb"\((?:\\.|[^\\)])*\)", replace_array_string, array_body)
+                            return b"[" + updated_array + b"]" + suffix
 
-            if matches == 0:
-                doc.close()
-                state['awaiting'] = None
-                bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
-                return
+                        modified_stream = re.sub(rb"\(((?:\\.|[^\\)])*)\)(\s*Tj)", replace_tj, stream)
+                        modified_stream = re.sub(rb"\[(.*?)\](\s*TJ)", replace_tj_array, modified_stream, flags=re.DOTALL)
 
-            output_path = new_private_pdf_path()
-            doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
-            doc.close()
-            send_processed_pdf(
-                user_id,
-                output_path,
-                build_output_name(state.get('original_name'), "watermark_removed"),
-                user_info=state.get('user_info'),
-            )
-            delete_file(output_path)
-            clear_user_state(user_id, delete_source=True)
-            print("Watermark-removed PDF sent successfully.")
-            return
-        except Exception as e:
-            print(f"Error removing watermark: {e}")
-            bot.reply_to(message, "Failed to remove watermark. Please try again.")
-            if output_path:
-                delete_file(output_path)
-            return
+                        if stream_matches > 0 and modified_stream != stream:
+                            doc.update_stream(xref, modified_stream)
+                            matches += stream_matches
+
+                if matches == 0:
+                    raise ValueError("No matching watermark text was found")
+
+                output_path = new_private_pdf_path()
+                doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+                send_processed_pdf(
+                    user_id,
+                    output_path,
+                    build_output_name(original_name, "watermark_removed"),
+                    user_info=user_info,
+                )
+                processed_count += 1
+            except Exception as e:
+                print(f"Error removing watermark from {original_name}: {e}")
+                failed_count += 1
+                bot.reply_to(message, f"Failed to remove watermark: {original_name}")
+            finally:
+                if doc:
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+                if output_path:
+                    delete_file(output_path)
+                if source_path:
+                    delete_file(source_path)
+
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch watermark removal completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        print("Watermark-removed PDF batch sent successfully.")
+        return
 
     if awaiting == 'watermark_add_text':
         watermark_text = (message.text or "").strip()
