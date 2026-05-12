@@ -14,6 +14,8 @@ BACKUP_GROUP_ID_STR = os.environ.get('BACKUP_GROUP_ID', '').strip()
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 PDF_SAVE_GARBAGE_LEVEL = 3
 RANDOM_WATERMARK_PAGE_INTERVAL = 3
+MIN_WATERMARK_TRANSPARENCY_PERCENT = 1
+MIN_WATERMARK_OPACITY = MIN_WATERMARK_TRANSPARENCY_PERCENT / 100.0
 TEXT_WATERMARK_HORIZONTAL_MARGIN_RATIO = 0.12
 TEXT_WATERMARK_TOP_RATIO = 0.42
 TEXT_WATERMARK_BOTTOM_RATIO = 0.58
@@ -321,7 +323,7 @@ def get_target_page_indexes(doc, layout):
 
 
 def add_text_watermark(doc, watermark_text, layout, transparency, orientation):
-    opacity = max(0.01, min(1.0, transparency / 100.0))
+    opacity = max(MIN_WATERMARK_OPACITY, min(1.0, transparency / 100.0))
     for page_index in get_target_page_indexes(doc, layout):
         page = doc[page_index]
         rect = page.rect
@@ -369,9 +371,11 @@ def add_text_watermark(doc, watermark_text, layout, transparency, orientation):
 def add_image_watermark(doc, image_path, layout, transparency):
     watermark_pixmap = None
     if transparency < 100:
-        alpha_value = max(1, min(255, round(255 * transparency / 100.0)))
+        min_alpha_value = max(1, round(255 * MIN_WATERMARK_OPACITY))
+        alpha_value = max(min_alpha_value, min(255, round(255 * transparency / 100.0)))
         base_pixmap = fitz.Pixmap(image_path)
         watermark_pixmap = fitz.Pixmap(base_pixmap, 1)
+        del base_pixmap
         watermark_pixmap.set_alpha(bytes([alpha_value]) * (watermark_pixmap.width * watermark_pixmap.height), premultiply=0)
 
     for page_index in get_target_page_indexes(doc, layout):
