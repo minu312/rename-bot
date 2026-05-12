@@ -674,7 +674,8 @@ def handle_document(message):
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
         return
 
-    state = get_or_create_user_state(user_id, extract_user_info(message.from_user))
+    with state_lock:
+        state = get_or_create_user_state(user_id, extract_user_info(message.from_user))
     if state and state.get('awaiting') == 'watermark_image_upload':
         if not is_supported_image_document(message.document):
             bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
