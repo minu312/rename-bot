@@ -677,27 +677,24 @@ def handle_document(message):
 
     with state_lock:
         state = get_or_create_user_state(user_id, user_info)
-        awaiting_watermark_upload = bool(state and state.get('awaiting') == 'watermark_image_upload')
-    if awaiting_watermark_upload:
-        if not is_supported_image_document(message.document):
-            bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
-            return
+        if state and state.get('awaiting') == 'watermark_image_upload':
+            if not is_supported_image_document(message.document):
+                bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
+                return
 
-        try:
-            image_path = download_telegram_file(
-                message.document.file_id,
-                get_safe_image_suffix(message.document.file_name, message.document.mime_type),
-            )
-            with state_lock:
-                state = get_or_create_user_state(user_id, user_info)
+            try:
+                image_path = download_telegram_file(
+                    message.document.file_id,
+                    get_safe_image_suffix(message.document.file_name, message.document.mime_type),
+                )
                 state['pending_watermark_image_path'] = image_path
                 state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
                 state['awaiting'] = 'watermark_transparency'
-            bot.reply_to(message, "Please send the watermark transparency level (1-100).")
-        except Exception as e:
-            print(f"Error downloading watermark image: {e}")
-            bot.reply_to(message, "Could not download the image. Please try again.")
-        return
+                bot.reply_to(message, "Please send the watermark transparency level (1-100).")
+            except Exception as e:
+                print(f"Error downloading watermark image: {e}")
+                bot.reply_to(message, "Could not download the image. Please try again.")
+            return
     
     if message.document.mime_type != 'application/pdf' and not message.document.file_name.lower().endswith('.pdf'):
         print("Not a valid PDF.")
