@@ -86,7 +86,7 @@ def get_user_lock(user_id):
 
 
 def get_db_connection():
-    return sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+    return sqlite3.connect(DATABASE_PATH)
 
 
 def initialize_database():
@@ -450,10 +450,13 @@ def get_or_create_user_state(user_id, user_info=None):
         state = {
             'awaiting': None,
             'pdf_queue': [],
+            'upload_slots_reserved': 0,
         }
         user_states[user_id] = state
     if 'pdf_queue' not in state:
         state['pdf_queue'] = []
+    if 'upload_slots_reserved' not in state:
+        state['upload_slots_reserved'] = 0
     if user_info:
         state['user_info'] = user_info
     return state
@@ -926,13 +929,15 @@ def handle_document(message):
     with user_lock:
         state = get_or_create_user_state(user_id, user_info)
         queue_count = len(get_pdf_queue(state))
+        reserved_count = max(0, int(state.get('upload_slots_reserved', 0)))
         plan = get_user_plan_info(user_id)
-        if not plan['is_premium'] and (plan['pdfs_processed'] + queue_count) >= FREE_PDF_WEEKLY_LIMIT:
+        if not plan['is_premium'] and (plan['pdfs_processed'] + queue_count + reserved_count) >= FREE_PDF_WEEKLY_LIMIT:
             bot.reply_to(
                 message,
                 "You have reached your free limit of 2 PDFs per week. Please purchase Premium to continue.",
             )
             return
+        state['upload_slots_reserved'] = reserved_count + 1
 
     original_name = message.document.file_name or "document.pdf"
     source_path = new_private_pdf_path()
@@ -944,12 +949,16 @@ def handle_document(message):
             source_file.write(downloaded_file)
     except Exception as e:
         print(f"Error downloading PDF: {e}")
+        with user_lock:
+            state = get_or_create_user_state(user_id, user_info)
+            state['upload_slots_reserved'] = max(0, int(state.get('upload_slots_reserved', 0)) - 1)
         bot.reply_to(message, "Could not download the PDF. Please try again.")
         delete_file(source_path)
         return
 
     with user_lock:
         state = get_or_create_user_state(user_id, user_info)
+        state['upload_slots_reserved'] = max(0, int(state.get('upload_slots_reserved', 0)) - 1)
         queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
         if queued:
             upsert_queue_action_menu(user_id, state)
