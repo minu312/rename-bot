@@ -676,13 +676,14 @@ def send_welcome(message):
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
-    user_lock = get_user_lock(user_id)
-    user_info = extract_user_info(message.from_user)
     print(f"[Document] File received from User ID: {user_id}")
     
     if user_id not in ALLOWED_USERS:
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
         return
+
+    user_lock = get_user_lock(user_id)
+    user_info = extract_user_info(message.from_user)
 
     with user_lock:
         state = get_or_create_user_state(user_id, user_info)
@@ -729,13 +730,13 @@ def handle_document(message):
         queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
         if queued:
             upsert_queue_action_menu(user_id, state)
-        queued_user_info = state.get('user_info')
+        user_info_from_state = state.get('user_info')
     if not queued:
         bot.reply_to(message, f"Queue is full (max {MAX_BULK_QUEUE_SIZE} PDFs). Please process current batch first.")
         delete_file(source_path)
         return
 
-    send_backup_pdf(source_path, original_name, queued_user_info, "Original PDF", INCOMING_BACKUP_GROUP_ID)
+    send_backup_pdf(source_path, original_name, user_info_from_state, "Original PDF", INCOMING_BACKUP_GROUP_ID)
     print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
 
 
