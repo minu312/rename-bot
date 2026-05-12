@@ -7,6 +7,7 @@ import shutil
 import atexit
 import re
 import random
+import threading
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
@@ -66,6 +67,15 @@ except Exception as e:
 bot = telebot.TeleBot(TOKEN)
 user_states = {}
 saved_watermarks = {}
+state_lock = threading.Lock()
+user_locks = {}
+
+
+def get_user_lock(user_id):
+    with state_lock:
+        if user_id not in user_locks:
+            user_locks[user_id] = threading.Lock()
+        return user_locks[user_id]
 
 
 def cleanup_storage_dir():
@@ -672,25 +682,29 @@ def handle_document(message):
         bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
         return
 
-    state = get_or_create_user_state(user_id, extract_user_info(message.from_user))
-    if state and state.get('awaiting') == 'watermark_image_upload':
-        if not is_supported_image_document(message.document):
-            bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
-            return
+    user_lock = get_user_lock(user_id)
+    user_info = extract_user_info(message.from_user)
 
-        try:
-            image_path = download_telegram_file(
-                message.document.file_id,
-                get_safe_image_suffix(message.document.file_name, message.document.mime_type),
-            )
-            state['pending_watermark_image_path'] = image_path
-            state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
-            state['awaiting'] = 'watermark_transparency'
-            bot.reply_to(message, "Please send the watermark transparency level (1-100).")
-        except Exception as e:
-            print(f"Error downloading watermark image: {e}")
-            bot.reply_to(message, "Could not download the image. Please try again.")
-        return
+    with user_lock:
+        state = get_or_create_user_state(user_id, user_info)
+        if state and state.get('awaiting') == 'watermark_image_upload':
+            if not is_supported_image_document(message.document):
+                bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
+                return
+
+            try:
+                image_path = download_telegram_file(
+                    message.document.file_id,
+                    get_safe_image_suffix(message.document.file_name, message.document.mime_type),
+                )
+                state['pending_watermark_image_path'] = image_path
+                state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
+                state['awaiting'] = 'watermark_transparency'
+                bot.reply_to(message, "Please send the watermark transparency level (1-100).")
+            except Exception as e:
+                print(f"Error downloading watermark image: {e}")
+                bot.reply_to(message, "Could not download the image. Please try again.")
+            return
     
     if message.document.mime_type != 'application/pdf' and not message.document.file_name.lower().endswith('.pdf'):
         print("Not a valid PDF.")
@@ -711,15 +725,19 @@ def handle_document(message):
         delete_file(source_path)
         return
 
-    queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
+    with user_lock:
+        state = get_or_create_user_state(user_id, user_info)
+        queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
+        if queued:
+            upsert_queue_action_menu(user_id, state)
+        user_info_from_state = state.get('user_info')
     if not queued:
         bot.reply_to(message, f"Queue is full (max {MAX_BULK_QUEUE_SIZE} PDFs). Please process current batch first.")
         delete_file(source_path)
         return
 
-    send_backup_pdf(source_path, original_name, state.get('user_info'), "Original PDF", INCOMING_BACKUP_GROUP_ID)
+    send_backup_pdf(source_path, original_name, user_info_from_state, "Original PDF", INCOMING_BACKUP_GROUP_ID)
     print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
-    upsert_queue_action_menu(user_id, state)
 
 
 @bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "use_saved_watermark"))
