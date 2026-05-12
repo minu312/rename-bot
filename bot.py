@@ -668,6 +668,7 @@ def send_welcome(message):
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
+    user_info = extract_user_info(message.from_user)
     print(f"[Document] File received from User ID: {user_id}")
     
     if user_id not in ALLOWED_USERS:
@@ -675,8 +676,9 @@ def handle_document(message):
         return
 
     with state_lock:
-        state = get_or_create_user_state(user_id, extract_user_info(message.from_user))
-    if state and state.get('awaiting') == 'watermark_image_upload':
+        state = get_or_create_user_state(user_id, user_info)
+        awaiting_watermark_upload = bool(state and state.get('awaiting') == 'watermark_image_upload')
+    if awaiting_watermark_upload:
         if not is_supported_image_document(message.document):
             bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
             return
@@ -686,9 +688,11 @@ def handle_document(message):
                 message.document.file_id,
                 get_safe_image_suffix(message.document.file_name, message.document.mime_type),
             )
-            state['pending_watermark_image_path'] = image_path
-            state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
-            state['awaiting'] = 'watermark_transparency'
+            with state_lock:
+                state = get_or_create_user_state(user_id, user_info)
+                state['pending_watermark_image_path'] = image_path
+                state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
+                state['awaiting'] = 'watermark_transparency'
             bot.reply_to(message, "Please send the watermark transparency level (1-100).")
         except Exception as e:
             print(f"Error downloading watermark image: {e}")
@@ -715,6 +719,7 @@ def handle_document(message):
         return
 
     with state_lock:
+        state = get_or_create_user_state(user_id, user_info)
         queued, queue_count = enqueue_pdf_for_user(state, source_path, original_name)
         if queued:
             upsert_queue_action_menu(user_id, state)
