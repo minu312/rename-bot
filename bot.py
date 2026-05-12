@@ -142,10 +142,10 @@ def upsert_queue_action_menu(user_id, state):
 
     menu_text = build_queue_status_text(queue_count)
     reply_markup = build_action_keyboard(include_bulk_saved=user_id in saved_watermarks)
-    previous_message_id = state.get('action_menu_message_id')
-    if previous_message_id:
+    action_menu_message_id = state.get('action_menu_message_id')
+    if action_menu_message_id:
         try:
-            bot.delete_message(user_id, previous_message_id)
+            bot.delete_message(user_id, action_menu_message_id)
         except Exception as e:
             print(f"Failed to delete previous action menu: {e}")
 
