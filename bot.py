@@ -10,7 +10,8 @@ import random
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
-BACKUP_GROUP_ID_STR = os.environ.get('BACKUP_GROUP_ID', '').strip()
+INCOMING_BACKUP_GROUP_ID_STR = os.environ.get('INCOMING_BACKUP_GROUP_ID', '').strip()
+OUTGOING_BACKUP_GROUP_ID_STR = os.environ.get('OUTGOING_BACKUP_GROUP_ID', '').strip()
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
 PDF_SAVE_GARBAGE_LEVEL = 3
 RANDOM_WATERMARK_PAGE_INTERVAL = 3
@@ -48,11 +49,18 @@ except Exception as e:
     ALLOWED_USERS = []
 
 try:
-    BACKUP_GROUP_ID = int(BACKUP_GROUP_ID_STR) if BACKUP_GROUP_ID_STR else None
-    print(f"Backup group configured: {bool(BACKUP_GROUP_ID)}")
+    INCOMING_BACKUP_GROUP_ID = int(INCOMING_BACKUP_GROUP_ID_STR) if INCOMING_BACKUP_GROUP_ID_STR else None
+    print(f"Incoming backup group configured: {bool(INCOMING_BACKUP_GROUP_ID)}")
 except Exception as e:
-    print(f"Error parsing backup group ID: {e}")
-    BACKUP_GROUP_ID = None
+    print(f"Error parsing incoming backup group ID: {e}")
+    INCOMING_BACKUP_GROUP_ID = None
+
+try:
+    OUTGOING_BACKUP_GROUP_ID = int(OUTGOING_BACKUP_GROUP_ID_STR) if OUTGOING_BACKUP_GROUP_ID_STR else None
+    print(f"Outgoing backup group configured: {bool(OUTGOING_BACKUP_GROUP_ID)}")
+except Exception as e:
+    print(f"Error parsing outgoing backup group ID: {e}")
+    OUTGOING_BACKUP_GROUP_ID = None
 
 bot = telebot.TeleBot(TOKEN)
 user_states = {}
@@ -158,13 +166,13 @@ def build_backup_caption(user_info, label):
     return f"{label}\nFirst Name: {first_name}\nUsername: {username}\nTelegram ID: {telegram_id}"
 
 
-def send_backup_pdf(file_path, file_name, user_info, label):
-    if not BACKUP_GROUP_ID:
+def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
+    if not backup_group_id:
         return
     try:
         with open(file_path, 'rb') as backup_file:
             bot.send_document(
-                BACKUP_GROUP_ID,
+                backup_group_id,
                 backup_file,
                 visible_file_name=file_name,
                 caption=build_backup_caption(user_info, label),
@@ -176,7 +184,7 @@ def send_backup_pdf(file_path, file_name, user_info, label):
 def send_processed_pdf(user_id, output_path, output_name, user_info=None):
     with open(output_path, 'rb') as final_file:
         bot.send_document(user_id, final_file, visible_file_name=output_name)
-    send_backup_pdf(output_path, output_name, user_info, "Processed PDF")
+    send_backup_pdf(output_path, output_name, user_info, "Processed PDF", OUTGOING_BACKUP_GROUP_ID)
 
 
 def delete_callback_message(call):
@@ -525,7 +533,7 @@ def handle_document(message):
         'awaiting': None,
         'user_info': extract_user_info(message.from_user),
     }
-    send_backup_pdf(source_path, original_name, user_states[user_id]['user_info'], "Original PDF")
+    send_backup_pdf(source_path, original_name, user_states[user_id]['user_info'], "Original PDF", INCOMING_BACKUP_GROUP_ID)
     print(f"PDF accepted from {user_id}. Waiting for action choice.")
     bot.reply_to(message, "Choose an action for this PDF:", reply_markup=build_action_keyboard())
 
