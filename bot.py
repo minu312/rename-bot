@@ -193,9 +193,9 @@ def save_current_watermark_profile(user_id, state):
         'type': watermark_type,
         'layout': state.get('watermark_layout', 'every'),
         'transparency': state.get('watermark_transparency', 100),
-        'orientation': state.get('watermark_orientation', 'horizontal'),
     }
     if watermark_type == 'text':
+        profile['orientation'] = state.get('watermark_orientation', 'horizontal')
         profile['text'] = state.get('pending_watermark_text', '')
     elif watermark_type == 'image':
         image_path = state.get('pending_watermark_image_path')
@@ -204,7 +204,6 @@ def save_current_watermark_profile(user_id, state):
         with open(image_path, 'rb') as image_file:
             profile['image_bytes'] = image_file.read()
         profile['image_suffix'] = state.get('pending_watermark_image_suffix') or os.path.splitext(image_path)[1] or ".png"
-        profile['orientation'] = None
     else:
         return False
     saved_watermarks[user_id] = profile
@@ -229,7 +228,7 @@ def apply_saved_watermark(user_id, state):
     state['watermark_type'] = profile.get('type')
     state['watermark_layout'] = profile.get('layout', 'every')
     state['watermark_transparency'] = profile.get('transparency', 100)
-    state['watermark_orientation'] = profile.get('orientation') or 'horizontal'
+    state['watermark_orientation'] = profile.get('orientation', 'horizontal')
     state['awaiting'] = None
 
     if profile.get('type') == 'text':
@@ -623,7 +622,7 @@ def handle_add_watermark_choices(call):
         return
 
     if call.data in ("watermark_orientation_horizontal", "watermark_orientation_diagonal"):
-        state['watermark_orientation'] = 'horizontal' if call.data == "watermark_orientation_horizontal" else 'diagonal'
+        state['watermark_orientation'] = call.data.rsplit('_', 1)[-1]
         state['awaiting'] = 'watermark_transparency'
         bot.answer_callback_query(call.id)
         bot.send_message(user_id, "Please send the watermark transparency level (1-100).")
