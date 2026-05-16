@@ -432,11 +432,14 @@ def burn_pdf_to_images(doc):
         # 1. Page eka image ekak (pixmap) karanawa
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         
-        # 2. Aluth PDF eke his page ekak hadanawa (original page size ekatama)
+        # 2. Image eka JPEG format ekata convert karala compress karanawa
+        img_bytes = pix.tobytes("jpeg")
+        
+        # 3. Aluth PDF eke his page ekak hadanawa (original page size ekatama)
         new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
         
-        # 3. Ara image eka aluth page ekata insert karanawa
-        new_page.insert_image(new_page.rect, pixmap=pix)
+        # 4. Ara compress karapu JPEG image eka insert karanawa
+        new_page.insert_image(new_page.rect, stream=img_bytes)
         
     return out_pdf
 
