@@ -8,16 +8,21 @@ import atexit
 import re
 import random
 import threading
-import sqlite3
+import pymongo
+from bson.binary import Binary
 import time
 from datetime import datetime, timezone
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
+MONGO_URI = os.environ.get('MONGO_URI')
+
+if not MONGO_URI:
+    print("CRITICAL WARNING: MONGO_URI environment variable is not set! Database functions will fail.")
+
 INCOMING_BACKUP_GROUP_ID_STR = os.environ.get('INCOMING_BACKUP_GROUP_ID', '').strip()
 OUTGOING_BACKUP_GROUP_ID_STR = os.environ.get('OUTGOING_BACKUP_GROUP_ID', '').strip()
 STORAGE_DIR = tempfile.mkdtemp(prefix='pdf-processor-')
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_database.db")
 PDF_SAVE_GARBAGE_LEVEL = 3
 MAX_BULK_QUEUE_SIZE = 50
 FREE_PDF_WEEKLY_LIMIT = 2
@@ -47,36 +52,38 @@ IMAGE_MIME_SUFFIX_MAP = {
 }
 
 print(f"Token loaded: {bool(TOKEN)}")
-print(f"Allowed users string: {ALLOWED_USERS_STR}")
 
 try:
     ALLOWED_USERS = [int(uid.strip()) for uid in ALLOWED_USERS_STR.split(',') if uid.strip()]
-    print(f"Allowed Users List: {ALLOWED_USERS}")
 except Exception as e:
-    print(f"Error parsing user IDs: {e}")
     ALLOWED_USERS = []
 
 try:
     INCOMING_BACKUP_GROUP_ID = int(INCOMING_BACKUP_GROUP_ID_STR) if INCOMING_BACKUP_GROUP_ID_STR else None
-    print(f"Incoming backup group configured: {bool(INCOMING_BACKUP_GROUP_ID)}")
-except Exception as e:
-    print(f"Error parsing incoming backup group ID: {e}")
+except Exception:
     INCOMING_BACKUP_GROUP_ID = None
 
 try:
     OUTGOING_BACKUP_GROUP_ID = int(OUTGOING_BACKUP_GROUP_ID_STR) if OUTGOING_BACKUP_GROUP_ID_STR else None
-    print(f"Outgoing backup group configured: {bool(OUTGOING_BACKUP_GROUP_ID)}")
-except Exception as e:
-    print(f"Error parsing outgoing backup group ID: {e}")
+except Exception:
     OUTGOING_BACKUP_GROUP_ID = None
 
 bot = telebot.TeleBot(TOKEN)
 user_states = {}
-saved_watermarks = {}
 state_lock = threading.Lock()
 user_locks = {}
-db_lock = threading.Lock()
 
+# MongoDB Setup
+if MONGO_URI:
+    mongo_client = pymongo.MongoClient(MONGO_URI)
+    db = mongo_client['pdf_bot_database']
+    users_col = db['users']
+    watermarks_col = db['watermarks']
+else:
+    mongo_client = None
+    db = None
+    users_col = None
+    watermarks_col = None
 
 def get_user_lock(user_id):
     with state_lock:
@@ -84,142 +91,79 @@ def get_user_lock(user_id):
             user_locks[user_id] = threading.Lock()
         return user_locks[user_id]
 
-
-def get_db_connection():
-    return sqlite3.connect(DATABASE_PATH)
-
-
 def initialize_database():
-    with db_lock:
-        connection = get_db_connection()
-        try:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    is_premium BOOLEAN DEFAULT 0,
-                    pdfs_processed INTEGER DEFAULT 0,
-                    last_reset_timestamp REAL
-                )
-                """
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
+    if mongo_client:
+        print("MongoDB Atlas configured.")
 
 def get_user_plan_info(user_id):
     now = time.time()
-    with db_lock:
-        connection = get_db_connection()
-        try:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
-                VALUES (?, 0, 0, ?)
-                """,
-                (user_id, now),
-            )
-            cursor = connection.execute(
-                "SELECT is_premium, pdfs_processed, last_reset_timestamp FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            row = cursor.fetchone()
-            is_premium = bool(row[0]) if row else False
-            pdfs_processed = int(row[1]) if row else 0
-            last_reset_timestamp = float(row[2]) if row and row[2] is not None else now
+    user = users_col.find_one({"user_id": user_id})
 
-            if not is_premium and now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
-                pdfs_processed = 0
-                last_reset_timestamp = now
-                connection.execute(
-                    "UPDATE users SET pdfs_processed = ?, last_reset_timestamp = ? WHERE user_id = ?",
-                    (pdfs_processed, last_reset_timestamp, user_id),
-                )
-            elif row and row[2] is None:
-                connection.execute(
-                    "UPDATE users SET last_reset_timestamp = ? WHERE user_id = ?",
-                    (last_reset_timestamp, user_id),
-                )
+    if not user:
+        user = {
+            "user_id": user_id,
+            "is_premium": False,
+            "pdfs_processed": 0,
+            "last_reset_timestamp": now,
+        }
+        users_col.insert_one(user)
 
-            connection.commit()
-            return {
-                'is_premium': is_premium,
-                'pdfs_processed': pdfs_processed,
-                'last_reset_timestamp': last_reset_timestamp,
-            }
-        finally:
-            connection.close()
+    is_premium = user.get("is_premium", False)
+    pdfs_processed = user.get("pdfs_processed", 0)
+    last_reset_timestamp = user.get("last_reset_timestamp", now)
 
+    if not is_premium and now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
+        pdfs_processed = 0
+        last_reset_timestamp = now
+        users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"pdfs_processed": pdfs_processed, "last_reset_timestamp": last_reset_timestamp}},
+        )
+
+    return {
+        'is_premium': is_premium,
+        'pdfs_processed': pdfs_processed,
+        'last_reset_timestamp': last_reset_timestamp,
+    }
 
 def increment_processed_pdf_count(user_id):
     now = time.time()
-    with db_lock:
-        connection = get_db_connection()
-        try:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
-                VALUES (?, 0, 0, ?)
-                """,
-                (user_id, now),
-            )
-            cursor = connection.execute(
-                "SELECT is_premium, pdfs_processed, last_reset_timestamp FROM users WHERE user_id = ?",
-                (user_id,),
-            )
-            row = cursor.fetchone()
-            if not row:
-                connection.commit()
-                return
+    user = users_col.find_one({"user_id": user_id})
 
-            is_premium = bool(row[0])
-            if is_premium:
-                connection.commit()
-                return
+    if not user:
+        get_user_plan_info(user_id)
+        user = users_col.find_one({"user_id": user_id})
 
-            pdfs_processed = int(row[1] or 0)
-            last_reset_timestamp = float(row[2]) if row[2] is not None else now
-            if now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
-                pdfs_processed = 0
-                last_reset_timestamp = now
+    if user and user.get("is_premium", False):
+        return
 
-            pdfs_processed += 1
-            connection.execute(
-                "UPDATE users SET pdfs_processed = ?, last_reset_timestamp = ? WHERE user_id = ?",
-                (pdfs_processed, last_reset_timestamp, user_id),
-            )
-            connection.commit()
-        finally:
-            connection.close()
+    pdfs_processed = user.get("pdfs_processed", 0)
+    last_reset_timestamp = user.get("last_reset_timestamp", now)
 
+    if now - last_reset_timestamp >= WEEKLY_RESET_SECONDS:
+        pdfs_processed = 0
+        last_reset_timestamp = now
+
+    pdfs_processed += 1
+    users_col.update_one(
+        {"user_id": user_id},
+        {"$set": {"pdfs_processed": pdfs_processed, "last_reset_timestamp": last_reset_timestamp}},
+    )
 
 def set_premium_status(user_id, is_premium):
     now = time.time()
-    with db_lock:
-        connection = get_db_connection()
-        try:
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO users (user_id, is_premium, pdfs_processed, last_reset_timestamp)
-                VALUES (?, 0, 0, ?)
-                """,
-                (user_id, now),
-            )
-            if is_premium:
-                connection.execute(
-                    "UPDATE users SET is_premium = 1 WHERE user_id = ?",
-                    (user_id,),
-                )
-            else:
-                connection.execute(
-                    "UPDATE users SET is_premium = 0, pdfs_processed = 0, last_reset_timestamp = ? WHERE user_id = ?",
-                    (now, user_id),
-                )
-            connection.commit()
-        finally:
-            connection.close()
-
+    if is_premium:
+        users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"is_premium": True}},
+            upsert=True,
+        )
+    else:
+        users_col.update_one(
+            {"user_id": user_id},
+            {"$set": {"is_premium": False, "pdfs_processed": 0, "last_reset_timestamp": now}},
+            upsert=True,
+        )
 
 def cleanup_storage_dir():
     try:
@@ -227,14 +171,12 @@ def cleanup_storage_dir():
     except Exception as e:
         print(f"Storage dir cleanup failed: {e}")
 
-
 def delete_file(path):
     if path and os.path.exists(path):
         try:
             os.remove(path)
         except Exception as e:
             print(f"Cleanup failed for {path}: {e}")
-
 
 def reset_watermark_state(state, delete_pending_image=True):
     if not state:
@@ -255,7 +197,6 @@ def reset_watermark_state(state, delete_pending_image=True):
     if awaiting.startswith('watermark_'):
         state['awaiting'] = None
 
-
 def clear_user_state(user_id, delete_source=False):
     state = user_states.get(user_id)
     if not state:
@@ -275,18 +216,14 @@ def clear_user_state(user_id, delete_source=False):
             delete_file(source_path)
     user_states.pop(user_id, None)
 
-
 def get_pdf_queue(state):
     return state.get('pdf_queue') or []
-
 
 def has_pdf_queue(state):
     return bool(get_pdf_queue(state))
 
-
 def build_queue_status_text(queue_count):
     return f"Received {queue_count} PDF(s). Send more if you want, then choose an action below:"
-
 
 def upsert_queue_action_menu(user_id, state):
     queue_count = len(get_pdf_queue(state))
@@ -294,13 +231,15 @@ def upsert_queue_action_menu(user_id, state):
         return
 
     menu_text = build_queue_status_text(queue_count)
-    reply_markup = build_action_keyboard(include_bulk_saved=user_id in saved_watermarks)
+    has_saved_watermark = watermarks_col.find_one({"user_id": user_id}) is not None
+    reply_markup = build_action_keyboard(include_bulk_saved=has_saved_watermark)
+    
     action_menu_message_id = state.get('action_menu_message_id')
     if action_menu_message_id:
         try:
             bot.delete_message(user_id, action_menu_message_id)
         except Exception as e:
-            print(f"Failed to delete previous action menu: {e}")
+            pass
 
     try:
         sent = bot.send_message(user_id, menu_text, reply_markup=reply_markup)
@@ -308,12 +247,10 @@ def upsert_queue_action_menu(user_id, state):
     except Exception as e:
         print(f"Failed to send action menu: {e}")
 
-
 def clear_action_menu_state(state):
     if not state:
         return
     state.pop('action_menu_message_id', None)
-
 
 def build_action_keyboard(include_bulk_saved=False):
     keyboard = types.InlineKeyboardMarkup()
@@ -325,7 +262,6 @@ def build_action_keyboard(include_bulk_saved=False):
     keyboard.row(types.InlineKeyboardButton("Unlock PDF", callback_data="unlock_pdf"))
     return keyboard
 
-
 def build_watermark_type_keyboard(include_saved=False):
     keyboard = types.InlineKeyboardMarkup()
     if include_saved:
@@ -334,13 +270,11 @@ def build_watermark_type_keyboard(include_saved=False):
     keyboard.row(types.InlineKeyboardButton("Image Watermark", callback_data="watermark_type_image"))
     return keyboard
 
-
 def build_watermark_layout_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(types.InlineKeyboardButton("Every page", callback_data="watermark_layout_every"))
     keyboard.row(types.InlineKeyboardButton("Random", callback_data="watermark_layout_random"))
     return keyboard
-
 
 def build_watermark_orientation_keyboard():
     keyboard = types.InlineKeyboardMarkup()
@@ -348,13 +282,11 @@ def build_watermark_orientation_keyboard():
     keyboard.row(types.InlineKeyboardButton("Diagonal", callback_data="watermark_orientation_diagonal"))
     return keyboard
 
-
 def build_watermark_save_keyboard():
     keyboard = types.InlineKeyboardMarkup()
     keyboard.row(types.InlineKeyboardButton("Yes", callback_data="watermark_save_yes"))
     keyboard.row(types.InlineKeyboardButton("No", callback_data="watermark_save_no"))
     return keyboard
-
 
 def extract_user_info(user):
     return {
@@ -363,13 +295,11 @@ def extract_user_info(user):
         'username': user.username or "",
     }
 
-
 def build_backup_caption(user_info, label):
     username = f"@{user_info.get('username')}" if user_info and user_info.get('username') else "N/A"
     first_name = user_info.get('first_name') if user_info else "N/A"
     telegram_id = user_info.get('id') if user_info else "N/A"
     return f"{label}\nFirst Name: {first_name}\nUsername: {username}\nTelegram ID: {telegram_id}"
-
 
 def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
     if not backup_group_id:
@@ -385,13 +315,11 @@ def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
     except Exception as e:
         print(f"Failed to send backup PDF: {e}")
 
-
 def send_processed_pdf(user_id, output_path, output_name, user_info=None):
     with open(output_path, 'rb') as final_file:
         bot.send_document(user_id, final_file, visible_file_name=output_name)
     increment_processed_pdf_count(user_id)
     send_backup_pdf(output_path, output_name, user_info, "Processed PDF", OUTGOING_BACKUP_GROUP_ID)
-
 
 def delete_callback_message(call):
     message = getattr(call, 'message', None)
@@ -401,7 +329,6 @@ def delete_callback_message(call):
         bot.delete_message(message.chat.id, message.message_id)
     except Exception as e:
         print(f"Failed to delete inline keyboard message: {e}")
-
 
 def save_current_watermark_profile(user_id, state):
     watermark_type = state.get('watermark_type')
@@ -418,13 +345,13 @@ def save_current_watermark_profile(user_id, state):
         if not image_path or not os.path.exists(image_path):
             return False
         with open(image_path, 'rb') as image_file:
-            profile['image_bytes'] = image_file.read()
+            profile['image_bytes'] = Binary(image_file.read())
         profile['image_suffix'] = state.get('pending_watermark_image_suffix') or os.path.splitext(image_path)[1] or ".png"
     else:
         return False
-    saved_watermarks[user_id] = profile
+        
+    watermarks_col.update_one({"user_id": user_id}, {"$set": profile}, upsert=True)
     return True
-
 
 def build_saved_watermark_image_path(profile):
     image_suffix = profile.get('image_suffix') or ".png"
@@ -432,7 +359,6 @@ def build_saved_watermark_image_path(profile):
     with open(image_path, 'wb') as image_file:
         image_file.write(profile.get('image_bytes', b''))
     return image_path
-
 
 def is_valid_saved_watermark_profile(profile):
     if not profile or profile.get('type') not in ('text', 'image'):
@@ -442,7 +368,6 @@ def is_valid_saved_watermark_profile(profile):
     if profile.get('type') == 'image':
         return bool(profile.get('image_bytes'))
     return False
-
 
 def get_or_create_user_state(user_id, user_info=None):
     state = user_states.get(user_id)
@@ -461,7 +386,6 @@ def get_or_create_user_state(user_id, user_info=None):
         state['user_info'] = user_info
     return state
 
-
 def enqueue_pdf_for_user(state, source_path, original_name):
     pdf_queue = state.setdefault('pdf_queue', [])
     if len(pdf_queue) >= MAX_BULK_QUEUE_SIZE:
@@ -475,9 +399,8 @@ def enqueue_pdf_for_user(state, source_path, original_name):
     state['original_name'] = original_name
     return True, len(pdf_queue)
 
-
 def apply_saved_watermark(user_id, state):
-    profile = saved_watermarks.get(user_id)
+    profile = watermarks_col.find_one({"user_id": user_id})
     if not profile:
         bot.send_message(user_id, "No saved watermark was found. Please create one first.")
         return
@@ -503,6 +426,14 @@ def apply_saved_watermark(user_id, state):
 
     bot.send_message(user_id, "Saved watermark data is incomplete. Please create it again.")
 
+def burn_pdf_to_images(doc):
+    out_pdf = fitz.open()
+    for page in doc:
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+        img_pdf = fitz.open("pdf", pix.pdfocr_tobytes())
+        out_pdf.insert_pdf(img_pdf)
+        img_pdf.close()
+    return out_pdf
 
 def process_saved_watermark_profile_for_pdf(source_path, profile):
     output_path = None
@@ -529,8 +460,10 @@ def process_saved_watermark_profile_for_pdf(source_path, profile):
         else:
             raise ValueError("Saved watermark type is invalid")
 
+        burned_doc = burn_pdf_to_images(doc)
         output_path = new_private_pdf_path()
-        doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+        burned_doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+        burned_doc.close()
         return output_path
     finally:
         if doc:
@@ -541,9 +474,8 @@ def process_saved_watermark_profile_for_pdf(source_path, profile):
         if image_path:
             delete_file(image_path)
 
-
 def process_bulk_saved_watermark(user_id, state):
-    profile = saved_watermarks.get(user_id)
+    profile = watermarks_col.find_one({"user_id": user_id})
     if not is_valid_saved_watermark_profile(profile):
         bot.send_message(user_id, "Saved watermark data is incomplete. Please create it again.")
         return
@@ -572,7 +504,6 @@ def process_bulk_saved_watermark(user_id, state):
             )
             processed_count += 1
         except Exception as e:
-            print(f"Bulk watermark failed for {original_name} ({type(e).__name__}): {e}")
             failed_count += 1
             bot.send_message(user_id, f"Failed to apply saved watermark: {original_name}")
         finally:
@@ -584,13 +515,11 @@ def process_bulk_saved_watermark(user_id, state):
     clear_user_state(user_id, delete_source=False)
     bot.send_message(user_id, f"Bulk processing completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
 
-
 def build_output_name(original_name, suffix):
     base_name = original_name or "document.pdf"
     if base_name.lower().endswith('.pdf'):
         base_name = base_name[:-4]
     return f"{base_name}_{suffix}.pdf"
-
 
 def normalize_pdf_filename(name):
     cleaned = os.path.basename((name or "").strip())
@@ -605,19 +534,16 @@ def normalize_pdf_filename(name):
         cleaned = f"{cleaned}.pdf"
     return cleaned
 
-
 def new_private_pdf_path():
     fd, temp_path = tempfile.mkstemp(suffix='.pdf', dir=STORAGE_DIR)
     os.close(fd)
     return temp_path
-
 
 def new_private_image_path(suffix):
     safe_suffix = suffix if suffix and len(suffix) <= MAX_IMAGE_SUFFIX_LENGTH else ".png"
     fd, temp_path = tempfile.mkstemp(suffix=safe_suffix, dir=STORAGE_DIR)
     os.close(fd)
     return temp_path
-
 
 def get_safe_image_suffix(file_name, mime_type=None):
     mapped_suffix = IMAGE_MIME_SUFFIX_MAP.get((mime_type or "").lower())
@@ -632,12 +558,10 @@ def get_safe_image_suffix(file_name, mime_type=None):
         return ".png"
     return extension
 
-
 def is_supported_image_document(document):
     mime_type = (document.mime_type or "").lower()
     file_name = (document.file_name or "").lower()
     return mime_type.startswith("image/") or file_name.endswith(SUPPORTED_IMAGE_SUFFIXES)
-
 
 def download_telegram_file(file_id, suffix):
     file_info = bot.get_file(file_id)
@@ -646,7 +570,6 @@ def download_telegram_file(file_id, suffix):
     with open(output_path, 'wb') as out_file:
         out_file.write(downloaded_file)
     return output_path
-
 
 def get_target_page_indexes(doc, layout):
     page_count = doc.page_count
@@ -657,7 +580,6 @@ def get_target_page_indexes(doc, layout):
         random_pages = [i for i in range(page_count) if i % RANDOM_WATERMARK_PAGE_INTERVAL == offset]
         return random_pages or [0]
     return list(range(page_count))
-
 
 def add_text_watermark(doc, watermark_text, layout, transparency, orientation):
     opacity = max(MIN_WATERMARK_OPACITY, min(1.0, transparency / 100.0))
@@ -704,7 +626,6 @@ def add_text_watermark(doc, watermark_text, layout, transparency, orientation):
             stroke_opacity=opacity,
         )
 
-
 def add_image_watermark(doc, image_path, layout, transparency):
     watermark_pixmap = None
     if transparency < 100:
@@ -730,7 +651,6 @@ def add_image_watermark(doc, image_path, layout, transparency):
             page.insert_image(image_rect, pixmap=watermark_pixmap, overlay=True, keep_proportion=True)
         else:
             page.insert_image(image_rect, filename=image_path, overlay=True, keep_proportion=True)
-
 
 def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
     pdf_queue = list(get_pdf_queue(state))
@@ -778,8 +698,10 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
             else:
                 add_image_watermark(doc, image_path, watermark_layout, watermark_transparency)
 
+            burned_doc = burn_pdf_to_images(doc)
             output_path = new_private_pdf_path()
-            doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+            burned_doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+            burned_doc.close()
             send_processed_pdf(
                 user_id,
                 output_path,
@@ -788,7 +710,6 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
             )
             processed_count += 1
         except Exception as e:
-            print(f"Error adding watermark for {original_name}: {e}")
             failed_count += 1
             bot.send_message(user_id, f"Failed to add watermark to: {original_name}")
         finally:
@@ -807,20 +728,12 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
     if image_path:
         delete_file(image_path)
 
-
 initialize_database()
 atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    print(f"[/start] Message received from User ID: {message.from_user.id}")
-    if message.from_user.id not in ALLOWED_USERS:
-        print(f"User {message.from_user.id} is NOT ALLOWED!")
-        bot.reply_to(message, f"Sorry, you are not authorized to use this bot. Your ID is {message.from_user.id}")
-        return
-    print(f"User {message.from_user.id} is allowed. Sending welcome message.")
     bot.reply_to(message, "Send me a PDF file to process.")
-
 
 @bot.message_handler(commands=['addpremium'])
 def add_premium(message):
@@ -843,7 +756,6 @@ def add_premium(message):
     set_premium_status(target_user_id, True)
     bot.reply_to(message, f"Premium enabled for user {target_user_id}.")
 
-
 @bot.message_handler(commands=['removepremium'])
 def remove_premium(message):
     admin_user_id = message.from_user.id
@@ -865,14 +777,9 @@ def remove_premium(message):
     set_premium_status(target_user_id, False)
     bot.reply_to(message, f"Premium removed for user {target_user_id}.")
 
-
 @bot.message_handler(commands=['myplan'])
 def my_plan(message):
     user_id = message.from_user.id
-    if user_id not in ALLOWED_USERS:
-        bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
-        return
-
     plan = get_user_plan_info(user_id)
     if plan['is_premium']:
         bot.reply_to(message, "Status: Premium 👑 (Unlimited PDFs)")
@@ -891,12 +798,6 @@ def my_plan(message):
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
-    print(f"[Document] File received from User ID: {user_id}")
-    
-    if user_id not in ALLOWED_USERS:
-        bot.reply_to(message, "Sorry, you are not authorized to use this bot.")
-        return
-
     user_lock = get_user_lock(user_id)
     user_info = extract_user_info(message.from_user)
 
@@ -917,12 +818,10 @@ def handle_document(message):
                 state['awaiting'] = 'watermark_transparency'
                 bot.reply_to(message, "Please send the watermark transparency level (1-100).")
             except Exception as e:
-                print(f"Error downloading watermark image: {e}")
                 bot.reply_to(message, "Could not download the image. Please try again.")
             return
     
     if message.document.mime_type != 'application/pdf' and not message.document.file_name.lower().endswith('.pdf'):
-        print("Not a valid PDF.")
         bot.reply_to(message, "Please send a valid PDF file.")
         return
 
@@ -948,7 +847,6 @@ def handle_document(message):
         with open(source_path, 'wb') as source_file:
             source_file.write(downloaded_file)
     except Exception as e:
-        print(f"Error downloading PDF: {e}")
         with user_lock:
             state = get_or_create_user_state(user_id, user_info)
             state['upload_slots_reserved'] = max(0, int(state.get('upload_slots_reserved', 0)) - 1)
@@ -969,17 +867,12 @@ def handle_document(message):
         return
 
     send_backup_pdf(source_path, original_name, user_info_from_state, "Original PDF", INCOMING_BACKUP_GROUP_ID)
-    print(f"PDF accepted from {user_id}. Queue count: {queue_count}")
 
 
 @bot.callback_query_handler(func=lambda call: call.data in ("rename_pdf", "unlock_pdf", "remove_watermark", "add_watermark", "use_saved_watermark"))
 def handle_action_choice(call):
     user_id = call.from_user.id
     delete_callback_message(call)
-
-    if user_id not in ALLOWED_USERS:
-        bot.answer_callback_query(call.id, "Not authorized.")
-        return
 
     if user_id not in user_states or not has_pdf_queue(user_states[user_id]):
         bot.answer_callback_query(call.id, "Please send a PDF first.")
@@ -1012,10 +905,12 @@ def handle_action_choice(call):
         reset_watermark_state(state, delete_pending_image=True)
         state['awaiting'] = 'watermark_type'
         bot.answer_callback_query(call.id)
+        
+        has_saved_watermark = watermarks_col.find_one({"user_id": user_id}) is not None
         bot.send_message(
             user_id,
             "Choose watermark type:",
-            reply_markup=build_watermark_type_keyboard(include_saved=user_id in saved_watermarks),
+            reply_markup=build_watermark_type_keyboard(include_saved=has_saved_watermark),
         )
         return
 
@@ -1042,10 +937,6 @@ def handle_add_watermark_choices(call):
     user_id = call.from_user.id
     delete_callback_message(call)
 
-    if user_id not in ALLOWED_USERS:
-        bot.answer_callback_query(call.id, "Not authorized.")
-        return
-
     state = user_states.get(user_id)
     if not state or not has_pdf_queue(state):
         bot.answer_callback_query(call.id, "Please send a PDF first.")
@@ -1066,10 +957,11 @@ def handle_add_watermark_choices(call):
 
     if state.get('watermark_type') not in ('text', 'image'):
         bot.answer_callback_query(call.id, "Choose watermark type first.")
+        has_saved_watermark = watermarks_col.find_one({"user_id": user_id}) is not None
         bot.send_message(
             user_id,
             "Please choose watermark type first.",
-            reply_markup=build_watermark_type_keyboard(include_saved=user_id in saved_watermarks),
+            reply_markup=build_watermark_type_keyboard(include_saved=has_saved_watermark),
         )
         return
 
@@ -1102,13 +994,9 @@ def handle_add_watermark_choices(call):
     state['awaiting'] = 'watermark_image_upload'
     bot.send_message(user_id, "Please upload the watermark image (photo or image document).")
 
-
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     user_id = message.from_user.id
-
-    if user_id not in ALLOWED_USERS:
-        return
 
     state = user_states.get(user_id)
     if not state or state.get('awaiting') != 'watermark_image_upload':
@@ -1126,21 +1014,14 @@ def handle_photo(message):
         state['awaiting'] = 'watermark_transparency'
         bot.reply_to(message, "Please send the watermark transparency level (1-100).")
     except Exception as e:
-        print(f"Error downloading watermark photo: {e}")
         bot.reply_to(message, "Could not download the image. Please try again.")
-
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
     user_id = message.from_user.id
-    print(f"[Text] Received input from User ID: {user_id}")
     
-    if user_id not in ALLOWED_USERS:
-        return
-
     state = user_states.get(user_id)
     if not state or not has_pdf_queue(state):
-        bot.reply_to(message, "Please send a PDF file first.")
         return
 
     awaiting = state.get('awaiting')
@@ -1167,7 +1048,6 @@ def handle_text(message):
                 send_processed_pdf(user_id, source_path, current_output_name, user_info=user_info)
                 processed_count += 1
             except Exception as e:
-                print(f"Error renaming PDF to {current_output_name}: {e}")
                 failed_count += 1
                 bot.send_message(user_id, f"Failed to rename: {pdf_item.get('original_name') or 'document.pdf'}")
             finally:
@@ -1175,7 +1055,6 @@ def handle_text(message):
                     delete_file(source_path)
         clear_user_state(user_id, delete_source=False)
         bot.send_message(user_id, f"Batch rename completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
-        print("Renamed PDF batch sent successfully.")
         return
 
     if awaiting == 'password':
@@ -1205,7 +1084,6 @@ def handle_text(message):
                 )
                 processed_count += 1
             except Exception as e:
-                print(f"Error unlocking {original_name}: {e}")
                 failed_count += 1
                 bot.send_message(user_id, f"Failed to unlock: {original_name}")
             finally:
@@ -1220,7 +1098,6 @@ def handle_text(message):
                     delete_file(source_path)
         clear_user_state(user_id, delete_source=False)
         bot.send_message(user_id, f"Batch unlock completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
-        print("Unlocked PDF batch sent successfully.")
         return
 
     if awaiting == 'watermark_text':
@@ -1297,7 +1174,7 @@ def handle_text(message):
                             suffix = match.group(2)
                             updated_body, removed = strip_from_literal_string(literal_body)
                             stream_matches += removed
-                            return b"(" + updated_body + b")" + suffix
+                            return b"[" + updated_body + b"]" + suffix
 
                         def replace_tj_array(match):
                             nonlocal stream_matches
@@ -1335,7 +1212,6 @@ def handle_text(message):
                 )
                 processed_count += 1
             except Exception as e:
-                print(f"Error removing watermark from {original_name}: {e}")
                 failed_count += 1
                 bot.send_message(user_id, f"Failed to remove watermark: {original_name}")
             finally:
@@ -1351,7 +1227,6 @@ def handle_text(message):
 
         clear_user_state(user_id, delete_source=False)
         bot.send_message(user_id, f"Batch watermark removal completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
-        print("Watermark-removed PDF batch sent successfully.")
         return
 
     if awaiting == 'watermark_add_text':
@@ -1386,7 +1261,9 @@ def handle_text(message):
         bot.reply_to(message, "Please choose Yes or No using the buttons above.")
         return
 
-    bot.reply_to(message, "Please choose 'Rename PDF', 'Remove Watermark', 'Add Watermark', or 'Unlock PDF' after sending a PDF.")
-
-print("Starting bot polling...")
-bot.polling(none_stop=True)
+if __name__ == "__main__":
+    if MONGO_URI:
+        print("Starting bot polling with MongoDB enabled...")
+    else:
+        print("Starting bot polling (WARNING: Database features will fail without MONGO_URI)")
+    bot.polling(none_stop=True)
