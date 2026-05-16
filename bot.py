@@ -429,10 +429,15 @@ def apply_saved_watermark(user_id, state):
 def burn_pdf_to_images(doc):
     out_pdf = fitz.open()
     for page in doc:
+        # 1. Page eka image ekak (pixmap) karanawa
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        img_pdf = fitz.open("pdf", pix.pdfocr_tobytes())
-        out_pdf.insert_pdf(img_pdf)
-        img_pdf.close()
+        
+        # 2. Aluth PDF eke his page ekak hadanawa (original page size ekatama)
+        new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
+        
+        # 3. Ara image eka aluth page ekata insert karanawa
+        new_page.insert_image(new_page.rect, pixmap=pix)
+        
     return out_pdf
 
 def process_saved_watermark_profile_for_pdf(source_path, profile):
