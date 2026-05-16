@@ -467,7 +467,7 @@ def process_saved_watermark_profile_for_pdf(source_path, profile):
 
         burned_doc = burn_pdf_to_images(doc)
         output_path = new_private_pdf_path()
-        burned_doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+       burned_doc.save(output_path, deflate=True, deflate_images=True, deflate_fonts=True, garbage=4, clean=True)
         burned_doc.close()
         return output_path
     finally:
@@ -705,7 +705,7 @@ def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
 
             burned_doc = burn_pdf_to_images(doc)
             output_path = new_private_pdf_path()
-            burned_doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+            burned_doc.save(output_path, deflate=True, deflate_images=True, deflate_fonts=True, garbage=4, clean=True)
             burned_doc.close()
             send_processed_pdf(
                 user_id,
