@@ -541,10 +541,11 @@ def process_bulk_saved_watermark(user_id, state):
     bot.send_message(user_id, f"Bulk processing completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
 
 def build_output_name(original_name, suffix):
-    base_name = original_name or "document.pdf"
-    if base_name.lower().endswith('.pdf'):
-        base_name = base_name[:-4]
-    return f"{base_name}_{suffix}.pdf"
+    # Suffix eka add wenne na, original nama ehemama yawanawa
+    name = original_name or "document.pdf"
+    if not name.lower().endswith('.pdf'):
+        name = f"{name}.pdf"
+    return name
 
 def normalize_pdf_filename(name):
     cleaned = os.path.basename((name or "").strip())
@@ -809,6 +810,16 @@ def my_plan(message):
     if plan['is_premium']:
         bot.reply_to(message, "Status: Premium 👑 (Unlimited PDFs)")
         return
+
+    reset_at = datetime.fromtimestamp(
+        plan['last_reset_timestamp'] + WEEKLY_RESET_SECONDS,
+        tz=timezone.utc,
+    )
+    reset_at_text = reset_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+    bot.reply_to(
+        message,
+        f"Status: Free 🆓\nPDFs processed this week: {plan['pdfs_processed']}/{FREE_PDF_WEEKLY_LIMIT}\nResets on: {reset_at_text}",
+    )
 
 @bot.message_handler(commands=['set_thumbnail'])
 def set_thumbnail_command(message):
