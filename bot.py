@@ -316,10 +316,27 @@ def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
         print(f"Failed to send backup PDF: {e}")
 
 def send_processed_pdf(user_id, output_path, output_name, user_info=None):
-    with open(output_path, 'rb') as final_file:
-        bot.send_document(user_id, final_file, visible_file_name=output_name)
-    increment_processed_pdf_count(user_id)
-    send_backup_pdf(output_path, output_name, user_info, "Processed PDF", OUTGOING_BACKUP_GROUP_ID)
+    user = users_col.find_one({"user_id": user_id}) if users_col else None
+    thumb_path = None
+    
+    try:
+        # User ge save karapu thumbnail ekak thiyenawada balanawa
+        if user and "thumbnail_bytes" in user:
+            thumb_path = new_private_image_path(".jpg")
+            with open(thumb_path, 'wb') as f:
+                f.write(user["thumbnail_bytes"])
+        
+        with open(output_path, 'rb') as final_file:
+            thumb_file = open(thumb_path, 'rb') if thumb_path else None
+            # Thumbnail eka thiyenawanam eka PDF ekata attach karanawa
+            bot.send_document(user_id, final_file, visible_file_name=output_name, thumb=thumb_file)
+            if thumb_file:
+                thumb_file.close()
+        
+        increment_processed_pdf_count(user_id)
+        send_backup_pdf(output_path, output_name, user_info, "Processed PDF", OUTGOING_BACKUP_GROUP_ID)
+    finally:
+        delete_file(thumb_path)
 
 def delete_callback_message(call):
     message = getattr(call, 'message', None)
@@ -793,6 +810,20 @@ def my_plan(message):
         bot.reply_to(message, "Status: Premium 👑 (Unlimited PDFs)")
         return
 
+@bot.message_handler(commands=['set_thumbnail'])
+def set_thumbnail_command(message):
+    user_id = message.from_user.id
+    state = get_or_create_user_state(user_id)
+    state['awaiting'] = 'thumbnail_upload'
+    bot.reply_to(message, "📸 Please send a 320x320 JPG image to set as the PDF thumbnail.")
+
+@bot.message_handler(commands=['delete_thumbnail'])
+def delete_thumbnail_command(message):
+    user_id = message.from_user.id
+    if users_col:
+        users_col.update_one({"user_id": user_id}, {"$unset": {"thumbnail_bytes": ""}})
+    bot.reply_to(message, "🗑️ Your thumbnail has been deleted. Future PDFs will be sent without a thumbnail.")
+    
     reset_at = datetime.fromtimestamp(
         plan['last_reset_timestamp'] + WEEKLY_RESET_SECONDS,
         tz=timezone.utc,
@@ -1005,24 +1036,47 @@ def handle_add_watermark_choices(call):
 @bot.message_handler(content_types=['photo'])
 def handle_photo(message):
     user_id = message.from_user.id
-
     state = user_states.get(user_id)
-    if not state or state.get('awaiting') != 'watermark_image_upload':
-        bot.reply_to(message, "Please send a PDF file first and choose 'Add Watermark'.")
+
+    if not state:
         return
 
-    if not message.photo:
-        bot.reply_to(message, "Please upload a valid image photo.")
+    awaiting = state.get('awaiting')
+
+    # Thumbnail eka upload kalama ekata save wena eka
+    if awaiting == 'thumbnail_upload':
+        try:
+            file_id = message.photo[-1].file_id # Hodama quality image eka gannawa
+            file_info = bot.get_file(file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            
+            if users_col:
+                users_col.update_one(
+                    {"user_id": user_id}, 
+                    {"$set": {"thumbnail_bytes": Binary(downloaded_file)}},
+                    upsert=True
+                )
+            state['awaiting'] = None
+            bot.reply_to(message, "✅ Thumbnail eka save una! Meeta passe process karana okkoma PDF walata meka auto attach wenawa.")
+        except Exception as e:
+            bot.reply_to(message, "❌ Thumbnail eka save karanna bari una. Karunakara apahu try karanna.")
         return
 
-    try:
-        image_path = download_telegram_file(message.photo[-1].file_id, TELEGRAM_PHOTO_DEFAULT_SUFFIX)
-        state['pending_watermark_image_path'] = image_path
-        state['pending_watermark_image_suffix'] = TELEGRAM_PHOTO_DEFAULT_SUFFIX
-        state['awaiting'] = 'watermark_transparency'
-        bot.reply_to(message, "Please send the watermark transparency level (1-100).")
-    except Exception as e:
-        bot.reply_to(message, "Could not download the image. Please try again.")
+    # Parana watermark image upload code eka
+    if awaiting == 'watermark_image_upload':
+        if not message.photo:
+            bot.reply_to(message, "Please upload a valid image photo.")
+            return
+
+        try:
+            image_path = download_telegram_file(message.photo[-1].file_id, TELEGRAM_PHOTO_DEFAULT_SUFFIX)
+            state['pending_watermark_image_path'] = image_path
+            state['pending_watermark_image_suffix'] = TELEGRAM_PHOTO_DEFAULT_SUFFIX
+            state['awaiting'] = 'watermark_transparency'
+            bot.reply_to(message, "Please send the watermark transparency level (1-100).")
+        except Exception as e:
+            bot.reply_to(message, "Could not download the image. Please try again.")
+        return
 
 @bot.message_handler(func=lambda message: True)
 def handle_text(message):
