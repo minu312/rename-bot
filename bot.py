@@ -320,7 +320,6 @@ def send_processed_pdf(user_id, output_path, output_name, user_info=None):
     thumb_path = None
     
     try:
-        # User ge save karapu thumbnail ekak thiyenawada balanawa
         if user and "thumbnail_bytes" in user:
             thumb_path = new_private_image_path(".jpg")
             with open(thumb_path, 'wb') as f:
@@ -328,7 +327,6 @@ def send_processed_pdf(user_id, output_path, output_name, user_info=None):
         
         with open(output_path, 'rb') as final_file:
             thumb_file = open(thumb_path, 'rb') if thumb_path else None
-            # Thumbnail eka thiyenawanam eka PDF ekata attach karanawa
             bot.send_document(user_id, final_file, visible_file_name=output_name, thumb=thumb_file)
             if thumb_file:
                 thumb_file.close()
@@ -446,18 +444,10 @@ def apply_saved_watermark(user_id, state):
 def burn_pdf_to_images(doc):
     out_pdf = fitz.open()
     for page in doc:
-        # 1. Page eka image ekak (pixmap) karanawa
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-        
-        # 2. Image eka JPEG format ekata convert karala compress karanawa
         img_bytes = pix.tobytes("jpeg")
-        
-        # 3. Aluth PDF eke his page ekak hadanawa (original page size ekatama)
         new_page = out_pdf.new_page(width=page.rect.width, height=page.rect.height)
-        
-        # 4. Ara compress karapu JPEG image eka insert karanawa
         new_page.insert_image(new_page.rect, stream=img_bytes)
-        
     return out_pdf
 
 def process_saved_watermark_profile_for_pdf(source_path, profile):
@@ -524,7 +514,7 @@ def process_bulk_saved_watermark(user_id, state):
             send_processed_pdf(
                 user_id,
                 output_path,
-                build_output_name(original_name, "watermarked"),
+                build_output_name(original_name, "watermarked"), # Kept for internal logic, doesn't append
                 user_info=user_info,
             )
             processed_count += 1
@@ -541,7 +531,6 @@ def process_bulk_saved_watermark(user_id, state):
     bot.send_message(user_id, f"Bulk processing completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
 
 def build_output_name(original_name, suffix):
-    # Suffix eka add wenne na, original nama ehemama yawanawa
     name = original_name or "document.pdf"
     if not name.lower().endswith('.pdf'):
         name = f"{name}.pdf"
@@ -835,7 +824,6 @@ def delete_thumbnail_command(message):
         users_col.update_one({"user_id": user_id}, {"$unset": {"thumbnail_bytes": ""}})
     bot.reply_to(message, "🗑️ Your thumbnail has been deleted. Future PDFs will be sent without a thumbnail.")
 
-
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     user_id = message.from_user.id
@@ -1065,10 +1053,9 @@ def handle_photo(message):
 
     awaiting = state.get('awaiting')
 
-    # Thumbnail eka upload kalama ekata save wena eka
     if awaiting == 'thumbnail_upload':
         try:
-            file_id = message.photo[-1].file_id # Hodama quality image eka gannawa
+            file_id = message.photo[-1].file_id 
             file_info = bot.get_file(file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             
@@ -1079,12 +1066,11 @@ def handle_photo(message):
                     upsert=True
                 )
             state['awaiting'] = None
-            bot.reply_to(message, "✅ Thumbnail eka save una! Meeta passe process karana okkoma PDF walata meka auto attach wenawa.")
+            bot.reply_to(message, "✅ Thumbnail saved! It will be automatically attached to all processed PDFs from now on.")
         except Exception as e:
-            bot.reply_to(message, "❌ Thumbnail eka save karanna bari una. Karunakara apahu try karanna.")
+            bot.reply_to(message, "❌ Failed to save the thumbnail. Please try again.")
         return
 
-    # Parana watermark image upload code eka
     if awaiting == 'watermark_image_upload':
         if not message.photo:
             bot.reply_to(message, "Please upload a valid image photo.")
@@ -1105,4 +1091,249 @@ def handle_text(message):
     user_id = message.from_user.id
     
     state = user_states.get(user_id)
-    if
+    if not state or not has_pdf_queue(state):
+        return
+
+    awaiting = state.get('awaiting')
+    if awaiting == 'new_name':
+        requested_name = (message.text or "").strip()
+
+        if not requested_name:
+            bot.reply_to(message, "File name cannot be empty. Please send a valid name.")
+            return
+
+        pdf_queue = list(get_pdf_queue(state))
+        output_name = normalize_pdf_filename(requested_name)
+        name_root, ext = os.path.splitext(output_name)
+        append_index_suffix = len(pdf_queue) > 1
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for index, pdf_item in enumerate(pdf_queue, start=1):
+            source_path = pdf_item.get('source_path')
+            current_output_name = output_name if not append_index_suffix else f"{name_root}_{index}{ext}"
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                send_processed_pdf(user_id, source_path, current_output_name, user_info=user_info)
+                processed_count += 1
+            except Exception as e:
+                failed_count += 1
+                bot.send_message(user_id, f"Failed to rename: {pdf_item.get('original_name') or 'document.pdf'}")
+            finally:
+                if source_path:
+                    delete_file(source_path)
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch rename completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        return
+
+    if awaiting == 'password':
+        password = message.text or ""
+        pdf_queue = list(get_pdf_queue(state))
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for pdf_item in pdf_queue:
+            source_path = pdf_item.get('source_path')
+            original_name = pdf_item.get('original_name') or "document.pdf"
+            output_path = None
+            doc = None
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                doc = fitz.open(source_path)
+                if doc.needs_pass and not doc.authenticate(password):
+                    raise ValueError("Incorrect password")
+                output_path = new_private_pdf_path()
+                doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+                send_processed_pdf(
+                    user_id,
+                    output_path,
+                    build_output_name(original_name, "unlocked"),
+                    user_info=user_info,
+                )
+                processed_count += 1
+            except Exception as e:
+                failed_count += 1
+                bot.send_message(user_id, f"Failed to unlock: {original_name}")
+            finally:
+                if doc:
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+                if output_path:
+                    delete_file(output_path)
+                if source_path:
+                    delete_file(source_path)
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch unlock completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        return
+
+    if awaiting == 'watermark_text':
+        watermark_text = message.text or ""
+
+        if not watermark_text.strip():
+            bot.reply_to(message, "Watermark text cannot be empty. Please send the exact text.")
+            return
+
+        target_variants = set()
+        for encoding in ("utf-8", "latin-1"):
+            try:
+                raw = watermark_text.encode(encoding)
+                if raw:
+                    target_variants.add(raw)
+                    target_variants.add(
+                        raw.replace(b"\\", b"\\\\").replace(b"(", b"\\(").replace(b")", b"\\)")
+                    )
+            except Exception:
+                continue
+
+        if not target_variants:
+            bot.reply_to(message, "No matching watermark text was found. Choose an action and try again.", reply_markup=build_action_keyboard())
+            return
+
+        def strip_from_literal_string(content_bytes):
+            removed = 0
+            updated = content_bytes
+            for target in target_variants:
+                if not target:
+                    continue
+                updated, count = re.subn(re.escape(target), b"", updated)
+                removed += count
+            return updated, removed
+
+        pdf_queue = list(get_pdf_queue(state))
+        processed_count = 0
+        failed_count = 0
+        user_info = state.get('user_info')
+        for pdf_item in pdf_queue:
+            source_path = pdf_item.get('source_path')
+            original_name = pdf_item.get('original_name') or "document.pdf"
+            output_path = None
+            doc = None
+            try:
+                if not source_path or not os.path.exists(source_path):
+                    raise FileNotFoundError("Source PDF not found")
+                doc = fitz.open(source_path)
+                if doc.needs_pass:
+                    raise ValueError("PDF is password protected")
+
+                matches = 0
+                processed_xrefs = set()
+
+                for page in doc:
+                    content_xrefs = page.get_contents() or []
+                    if isinstance(content_xrefs, int):
+                        content_xrefs = [content_xrefs]
+
+                    for xref in content_xrefs:
+                        if xref in processed_xrefs:
+                            continue
+                        processed_xrefs.add(xref)
+
+                        stream = doc.xref_stream(xref)
+                        if not stream:
+                            continue
+
+                        stream_matches = 0
+
+                        def replace_tj(match):
+                            nonlocal stream_matches
+                            literal_body = match.group(1)
+                            suffix = match.group(2)
+                            updated_body, removed = strip_from_literal_string(literal_body)
+                            stream_matches += removed
+                            return b"[" + updated_body + b"]" + suffix
+
+                        def replace_tj_array(match):
+                            nonlocal stream_matches
+                            array_body = match.group(1)
+                            suffix = match.group(2)
+
+                            def replace_array_string(s_match):
+                                nonlocal stream_matches
+                                literal = s_match.group(0)
+                                inner = literal[1:-1]
+                                updated_inner, removed = strip_from_literal_string(inner)
+                                stream_matches += removed
+                                return b"(" + updated_inner + b")"
+
+                            updated_array = re.sub(rb"\((?:\\.|[^\\)])*\)", replace_array_string, array_body)
+                            return b"[" + updated_array + b"]" + suffix
+
+                        modified_stream = re.sub(rb"\(((?:\\.|[^\\)])*)\)(\s*Tj)", replace_tj, stream)
+                        modified_stream = re.sub(rb"\[(.*?)\](\s*TJ)", replace_tj_array, modified_stream, flags=re.DOTALL)
+
+                        if stream_matches > 0 and modified_stream != stream:
+                            doc.update_stream(xref, modified_stream)
+                            matches += stream_matches
+
+                if matches == 0:
+                    raise ValueError("No matching watermark text was found")
+
+                output_path = new_private_pdf_path()
+                doc.save(output_path, deflate=True, garbage=PDF_SAVE_GARBAGE_LEVEL)
+                send_processed_pdf(
+                    user_id,
+                    output_path,
+                    build_output_name(original_name, "watermark_removed"),
+                    user_info=user_info,
+                )
+                processed_count += 1
+            except Exception as e:
+                failed_count += 1
+                bot.send_message(user_id, f"Failed to remove watermark: {original_name}")
+            finally:
+                if doc:
+                    try:
+                        doc.close()
+                    except Exception:
+                        pass
+                if output_path:
+                    delete_file(output_path)
+                if source_path:
+                    delete_file(source_path)
+
+        clear_user_state(user_id, delete_source=False)
+        bot.send_message(user_id, f"Batch watermark removal completed.\nProcessed: {processed_count}\nFailed: {failed_count}")
+        return
+
+    if awaiting == 'watermark_add_text':
+        watermark_text = (message.text or "").strip()
+        if not watermark_text:
+            bot.reply_to(message, "Watermark text cannot be empty. Please send valid text.")
+            return
+        state['pending_watermark_text'] = watermark_text
+        state['awaiting'] = 'watermark_orientation'
+        bot.reply_to(message, "Choose text orientation:", reply_markup=build_watermark_orientation_keyboard())
+        return
+
+    if awaiting == 'watermark_orientation':
+        bot.reply_to(message, "Please choose the text orientation using the buttons above.")
+        return
+
+    if awaiting == 'watermark_transparency':
+        transparency_text = (message.text or "").strip()
+        if not transparency_text.isdigit():
+            bot.reply_to(message, "Please send a number between 1 and 100 for transparency.")
+            return
+        transparency = int(transparency_text)
+        if transparency < 1 or transparency > 100:
+            bot.reply_to(message, "Transparency must be between 1 and 100.")
+            return
+        state['watermark_transparency'] = transparency
+        state['awaiting'] = 'watermark_save_choice'
+        bot.reply_to(message, "Do you want to save this watermark?", reply_markup=build_watermark_save_keyboard())
+        return
+
+    if awaiting == 'watermark_save_choice':
+        bot.reply_to(message, "Please choose Yes or No using the buttons above.")
+        return
+
+if __name__ == "__main__":
+    if MONGO_URI:
+        print("Starting bot polling with MongoDB enabled...")
+    else:
+        print("Starting bot polling (WARNING: Database features will fail without MONGO_URI)")
+    bot.polling(none_stop=True)
