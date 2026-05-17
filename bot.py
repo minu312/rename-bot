@@ -835,15 +835,6 @@ def delete_thumbnail_command(message):
         users_col.update_one({"user_id": user_id}, {"$unset": {"thumbnail_bytes": ""}})
     bot.reply_to(message, "🗑️ Your thumbnail has been deleted. Future PDFs will be sent without a thumbnail.")
     
-    reset_at = datetime.fromtimestamp(
-        plan['last_reset_timestamp'] + WEEKLY_RESET_SECONDS,
-        tz=timezone.utc,
-    )
-    reset_at_text = reset_at.strftime("%Y-%m-%d %H:%M:%S UTC")
-    bot.reply_to(
-        message,
-        f"Status: Free 🆓\nPDFs processed this week: {plan['pdfs_processed']}/{FREE_PDF_WEEKLY_LIMIT}\nResets on: {reset_at_text}",
-    )
 
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
