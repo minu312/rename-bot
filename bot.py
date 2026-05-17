@@ -844,9 +844,11 @@ def handle_document(message):
 
     with user_lock:
         state = get_or_create_user_state(user_id, user_info)
-        if state and state.get('awaiting') == 'watermark_image_upload':
+        
+        # Catch if a thumbnail or watermark is sent as a document/file instead of a photo
+        if state and state.get('awaiting') in ['watermark_image_upload', 'thumbnail_upload']:
             if not is_supported_image_document(message.document):
-                bot.reply_to(message, "Please upload a valid image (PNG/JPG/WebP) for the watermark logo.")
+                bot.reply_to(message, "Please upload a valid image (PNG/JPG) file.")
                 return
 
             try:
@@ -854,10 +856,28 @@ def handle_document(message):
                     message.document.file_id,
                     get_safe_image_suffix(message.document.file_name, message.document.mime_type),
                 )
-                state['pending_watermark_image_path'] = image_path
-                state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
-                state['awaiting'] = 'watermark_transparency'
-                bot.reply_to(message, "Please send the watermark transparency level (1-100).")
+                
+                # If it's a thumbnail, save it directly to MongoDB
+                if state.get('awaiting') == 'thumbnail_upload':
+                    with open(image_path, 'rb') as f:
+                        image_bytes = f.read()
+                    if users_col:
+                        users_col.update_one(
+                            {"user_id": user_id}, 
+                            {"$set": {"thumbnail_bytes": Binary(image_bytes)}},
+                            upsert=True
+                        )
+                    state['awaiting'] = None
+                    bot.reply_to(message, "✅ Thumbnail saved! It will be automatically attached to all processed PDFs from now on.")
+                    delete_file(image_path)
+                    return
+                # If it's a watermark, proceed to the next step
+                else:
+                    state['pending_watermark_image_path'] = image_path
+                    state['pending_watermark_image_suffix'] = get_safe_image_suffix(message.document.file_name, message.document.mime_type)
+                    state['awaiting'] = 'watermark_transparency'
+                    bot.reply_to(message, "Please send the watermark transparency level (1-100).")
+                    return
             except Exception as e:
                 bot.reply_to(message, "Could not download the image. Please try again.")
             return
