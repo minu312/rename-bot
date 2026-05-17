@@ -92,7 +92,7 @@ def get_user_lock(user_id):
         return user_locks[user_id]
 
 def initialize_database():
-    if mongo_client:
+    if mongo_client is not None:
         print("MongoDB Atlas configured.")
 
 def get_user_plan_info(user_id):
@@ -316,7 +316,7 @@ def send_backup_pdf(file_path, file_name, user_info, label, backup_group_id):
         print(f"Failed to send backup PDF: {e}")
 
 def send_processed_pdf(user_id, output_path, output_name, user_info=None):
-    user = users_col.find_one({"user_id": user_id}) if users_col else None
+    user = users_col.find_one({"user_id": user_id}) if users_col is not None else None
     thumb_path = None
     
     try:
@@ -514,7 +514,7 @@ def process_bulk_saved_watermark(user_id, state):
             send_processed_pdf(
                 user_id,
                 output_path,
-                build_output_name(original_name, "watermarked"), # Kept for internal logic, doesn't append
+                build_output_name(original_name, "watermarked"), 
                 user_info=user_info,
             )
             processed_count += 1
@@ -820,7 +820,7 @@ def set_thumbnail_command(message):
 @bot.message_handler(commands=['delete_thumbnail'])
 def delete_thumbnail_command(message):
     user_id = message.from_user.id
-    if users_col:
+    if users_col is not None:
         users_col.update_one({"user_id": user_id}, {"$unset": {"thumbnail_bytes": ""}})
     bot.reply_to(message, "🗑️ Your thumbnail has been deleted. Future PDFs will be sent without a thumbnail.")
 
@@ -849,7 +849,7 @@ def handle_document(message):
                 if state.get('awaiting') == 'thumbnail_upload':
                     with open(image_path, 'rb') as f:
                         image_bytes = f.read()
-                    if users_col:
+                    if users_col is not None:
                         users_col.update_one(
                             {"user_id": user_id}, 
                             {"$set": {"thumbnail_bytes": Binary(image_bytes)}},
@@ -1059,7 +1059,7 @@ def handle_photo(message):
             file_info = bot.get_file(file_id)
             downloaded_file = bot.download_file(file_info.file_path)
             
-            if users_col:
+            if users_col is not None:
                 users_col.update_one(
                     {"user_id": user_id}, 
                     {"$set": {"thumbnail_bytes": Binary(downloaded_file)}},
