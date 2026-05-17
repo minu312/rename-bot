@@ -169,7 +169,8 @@ def cleanup_storage_dir():
     try:
         shutil.rmtree(STORAGE_DIR, ignore_errors=True)
     except Exception as e:
-        print(f"Storage dir cleanup failed: {e}")
+                bot.reply_to(message, f"❌ System Error: {str(e)}\n\nCould not download the image. Please try again.")
+            return
 
 def delete_file(path):
     if path and os.path.exists(path):
