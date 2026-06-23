@@ -12,6 +12,8 @@ import pymongo
 from bson.binary import Binary
 import time
 from datetime import datetime, timezone
+from PIL import Image
+import io
 
 TOKEN = os.environ.get('BOT_TOKEN')
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
@@ -642,30 +644,55 @@ def add_text_watermark(doc, watermark_text, layout, transparency, orientation):
         )
 
 def add_image_watermark(doc, image_path, layout, transparency):
-    watermark_pixmap = None
-    if transparency < 100:
-        min_alpha_value = max(1, round(255 * MIN_WATERMARK_OPACITY))
-        alpha_value = max(min_alpha_value, min(255, round(255 * transparency / 100.0)))
-        base_pixmap = fitz.Pixmap(image_path)
-        watermark_pixmap = fitz.Pixmap(base_pixmap, 1)
-        del base_pixmap
-        watermark_pixmap.set_alpha(bytes([alpha_value]) * (watermark_pixmap.width * watermark_pixmap.height), premultiply=0)
+    # PDF eke first page eken dimensions gannawa watermark size eka hadanna
+    first_page = doc[0]
+    rect = first_page.rect
+    
+    # Userge ratios walata anuwa target size eka hadagannawa
+    target_width = int(rect.width * IMAGE_WATERMARK_WIDTH_RATIO)
+    target_height = int(rect.height * IMAGE_WATERMARK_HEIGHT_RATIO)
+    
+    try:
+        # Pillow eken image eka open karala RGBA walata gannawa
+        wm_img = Image.open(image_path).convert("RGBA")
+        
+        # High quality resize karanawa (thumbnail use karanne aspect ratio eka kedei nathuwa resize karanna)
+        wm_img.thumbnail((target_width, target_height), Image.Resampling.LANCZOS)
+        
+        # Resize kalata passe thiyena actual width and height
+        final_width, final_height = wm_img.size
+        
+        # Opacity eka wens kireema
+        if transparency < 100:
+            opacity_level = max(MIN_WATERMARK_OPACITY, transparency / 100.0)
+            alpha = wm_img.split()[3]
+            alpha = alpha.point(lambda p: p * opacity_level)
+            wm_img.putalpha(alpha)
+            
+        # Process karapu image eka memory (bytes) walata save karanawa
+        img_byte_arr = io.BytesIO()
+        wm_img.save(img_byte_arr, format='PNG')
+        img_bytes = img_byte_arr.getvalue()
+        
+    except Exception as e:
+        print(f"Watermark image processing failed: {e}")
+        return
 
+    # PDF pages walata watermark eka apply kirima
     for page_index in get_target_page_indexes(doc, layout):
         page = doc[page_index]
         rect = page.rect
-        watermark_width = rect.width * IMAGE_WATERMARK_WIDTH_RATIO
-        watermark_height = rect.height * IMAGE_WATERMARK_HEIGHT_RATIO
-        image_rect = fitz.Rect(
-            (rect.width - watermark_width) / 2,
-            (rect.height - watermark_height) / 2,
-            (rect.width + watermark_width) / 2,
-            (rect.height + watermark_height) / 2,
-        )
-        if watermark_pixmap is not None:
-            page.insert_image(image_rect, pixmap=watermark_pixmap, overlay=True, keep_proportion=True)
-        else:
-            page.insert_image(image_rect, filename=image_path, overlay=True, keep_proportion=True)
+        
+        # Image eka center karanna coordinates hadagannawa
+        x0 = (rect.width - final_width) / 2
+        y0 = (rect.height - final_height) / 2
+        x1 = x0 + final_width
+        y1 = y0 + final_height
+        
+        image_rect = fitz.Rect(x0, y0, x1, y1)
+        
+        # Bytes haraha image eka PDF ekata insert karanawa
+        page.insert_image(image_rect, stream=img_bytes, overlay=True)
 
 def process_add_watermark(user_id, state, watermark_text=None, image_path=None):
     pdf_queue = list(get_pdf_queue(state))
