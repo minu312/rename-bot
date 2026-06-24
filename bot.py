@@ -16,6 +16,18 @@ from PIL import Image
 import io
 
 TOKEN = os.environ.get('BOT_TOKEN')
+WELCOME_CHANNEL_ID_STR = os.environ.get('WELCOME_CHANNEL_ID', '').strip()
+WELCOME_MESSAGE_ID_STR = os.environ.get('WELCOME_MESSAGE_ID', '').strip()
+
+try:
+    WELCOME_CHANNEL_ID = int(WELCOME_CHANNEL_ID_STR) if WELCOME_CHANNEL_ID_STR and WELCOME_CHANNEL_ID_STR.lstrip('-').isdigit() else WELCOME_CHANNEL_ID_STR
+except Exception:
+    WELCOME_CHANNEL_ID = None
+
+try:
+    WELCOME_MESSAGE_ID = int(WELCOME_MESSAGE_ID_STR) if WELCOME_MESSAGE_ID_STR else None
+except Exception:
+    WELCOME_MESSAGE_ID = None
 ALLOWED_USERS_STR = os.environ.get('ALLOWED_USERS', '')
 MONGO_URI = os.environ.get('MONGO_URI')
 
@@ -775,7 +787,21 @@ atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "Send me a PDF file to process.")
+   user_id = message.from_user.id
+    
+    if WELCOME_CHANNEL_ID and WELCOME_MESSAGE_ID:
+        try:
+        
+            bot.forward_message(
+                chat_id=user_id,
+                from_chat_id=WELCOME_CHANNEL_ID,
+                message_id=WELCOME_MESSAGE_ID
+            )
+        except Exception as e:
+            print(f"Failed to forward the welcome message: {e}")
+            bot.reply_to(message, "Send me a PDF file to process.")
+    else:
+        bot.reply_to(message, "Send me a PDF file to process.")
 
 @bot.message_handler(commands=['addpremium'])
 def add_premium(message):
