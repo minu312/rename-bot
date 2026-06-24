@@ -14,6 +14,8 @@ import time
 from datetime import datetime, timezone
 from PIL import Image
 import io
+import logging
+telebot.logger.setLevel(logging.DEBUG)
 
 TOKEN = os.environ.get('BOT_TOKEN')
 WELCOME_CHANNEL_ID_STR = os.environ.get('WELCOME_CHANNEL_ID', '').strip()
