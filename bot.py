@@ -789,11 +789,10 @@ atexit.register(cleanup_storage_dir)
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-   user_id = message.from_user.id
+    user_id = message.from_user.id
     
     if WELCOME_CHANNEL_ID and WELCOME_MESSAGE_ID:
         try:
-        
             bot.forward_message(
                 chat_id=user_id,
                 from_chat_id=WELCOME_CHANNEL_ID,
